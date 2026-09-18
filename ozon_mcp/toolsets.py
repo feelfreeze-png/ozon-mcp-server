@@ -25,10 +25,15 @@ CORE = "core"
 # порядок важен: первое совпадение выигрывает
 RULES: tuple[tuple[str, str], ...] = (
     (CORE,        r"^ozon_(list_shops|diagnostics|degradations|company|notification|notifications)"),
-    ("pricing",   r"^ozon_(get_prices|set_prices|min_price|pricing|actions|seller_action|discount)"),
+    # `action` без `s`: под `actions` не попадало автодобавление в акции
+    # (ozon_action_auto_add_*), и оно проваливалось в core — то есть ехало всегда.
+    ("pricing",   r"^ozon_(get_prices|set_prices|min_price|pricing|action|seller_action|discount)"),
     ("ads",       r"^ozon_(ad|search_promo)"),
     ("catalog",   r"^ozon_(product|category|brand|certificate)"),
-    ("orders",    r"^ozon_(order|orders|supply|warehouse|delivery|cancellation)"),
+    # `carriage` — отгрузки и перевозки FBS: логистика, а не «общее». Без этого
+    # слова три ручки отгрузок проваливались в core и приезжали даже там, где
+    # склады выключены целиком.
+    ("orders",    r"^ozon_(order|orders|supply|warehouse|delivery|cancellation|carriage)"),
     ("analytics", r"^ozon_(analytics|stock_on|search_queries|report|rating)"),
     ("feedback",  r"^ozon_(review|question|chat|returns)"),
     ("finance",   r"^ozon_finance"),

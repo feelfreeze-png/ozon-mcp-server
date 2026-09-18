@@ -56,3 +56,22 @@ async def test_disabled_tool_explains_itself(monkeypatch):
     blocks = await _call_tool_impl("ozon_reviews", {"shop_id": "нет-такого"})
     text = blocks[0].text
     assert "feedback" in text and "OZON_TOOLSETS" in text
+
+
+def test_no_tool_relies_on_the_core_fallback():
+    """Ни один инструмент не должен попадать в core «по остаточному принципу».
+
+    profile_of отправляет в core любое имя, не совпавшее ни с одним правилом, а core
+    включён всегда. Значит опечатка в правиле ничего не ломает заметно: инструмент
+    просто начинает ехать во ВСЕХ сборках, включая те, где его выключили намеренно.
+    Так в сборку «только реклама» уезжали отгрузки ozon_carriage_* и автодобавление
+    в акции ozon_action_auto_add_*.
+
+    Проверять это через profile_of бесполезно — он вернёт core, и провал выглядит
+    как норма: штатный test_every_tool_belongs_to_a_profile ровно поэтому и был
+    зелёным всё это время. Сверяться надо с правилами напрямую.
+    """
+    import re
+    fell_through = [t.name for t in TOOLS
+                    if not any(re.match(p, t.name) for _, p in toolsets.RULES)]
+    assert not fell_through, fell_through
