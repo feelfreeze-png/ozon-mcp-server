@@ -19,6 +19,7 @@ from ozon_mcp.server import get_mcp_app, reset_all_clients, reset_shop, set_stat
 from ozon_mcp import settings as cfg
 from ozon_mcp import stats
 from ozon_mcp import diagnostics as diag
+from ozon_mcp import tenancy
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -98,15 +99,35 @@ fastapi_app = FastAPI(lifespan=lifespan)
 
 # ─── Авторизация MCP-эндпоинтов ─────────────────────────────
 
-def _check_mcp_auth(request: Request) -> bool:
-    """Проверка Bearer-токена для /sse и /messages. Без MCP_AUTH_TOKEN — пропуск."""
-    if not MCP_AUTH_TOKEN:
-        return True
+def _request_token(request: Request) -> str:
+    """Токен из заголовка Authorization, иначе из ?token=."""
     auth = request.headers.get("authorization", "")
     token = auth.removeprefix("Bearer ").strip()
     if not token:
         token = request.query_params.get("token", "")
-    return secrets.compare_digest(token, MCP_AUTH_TOKEN)
+    return token
+
+
+def _resolve_mcp_auth(request: Request) -> tuple[bool, str | None]:
+    """`(допущен, привязанный shop_id)` для /sse и /messages.
+
+    Личные токены клиентов, если заданы, ПОЛНОСТЬЮ вытесняют общий MCP_AUTH_TOKEN.
+    Иначе общий остался бы входом без привязки к магазину — то есть ровно той дырой,
+    ради которой режим и вводится: достаточно было бы предъявить его вместо своего,
+    чтобы снова выбирать магазин аргументом.
+    """
+    token = _request_token(request)
+    if tenancy.is_enabled():
+        shop_id = tenancy.resolve(token)
+        return shop_id is not None, shop_id
+    if not MCP_AUTH_TOKEN:
+        return True, None
+    return secrets.compare_digest(token, MCP_AUTH_TOKEN), None
+
+
+def _check_mcp_auth(request: Request) -> bool:
+    """Проверка Bearer-токена для /sse и /messages. Без MCP_AUTH_TOKEN — пропуск."""
+    return _resolve_mcp_auth(request)[0]
 
 
 def _is_live_session(request: Request) -> bool:
@@ -131,13 +152,21 @@ def _is_live_session(request: Request) -> bool:
 
 @fastapi_app.get("/sse")
 async def sse_endpoint(request: Request):
-    if not _check_mcp_auth(request):
+    allowed, shop_id = _resolve_mcp_auth(request)
+    if not allowed:
         return Response("Unauthorized", status_code=401)
-    mcp_app = get_mcp_app()
-    async with sse_transport.connect_sse(
-        request.scope, request.receive, request._send
-    ) as (read_stream, write_stream):
-        await mcp_app.run(read_stream, write_stream, mcp_app.create_initialization_options())
+    # Привязка ставится ДО mcp_app.run: вызовы инструментов исполняются внутри его
+    # цикла, в этой же задаче, и подхватывают контекст сами. POST /messages только
+    # кладёт сообщение в поток сессии, своего контекста у него нет.
+    pin = tenancy.pin(shop_id)
+    try:
+        mcp_app = get_mcp_app()
+        async with sse_transport.connect_sse(
+            request.scope, request.receive, request._send
+        ) as (read_stream, write_stream):
+            await mcp_app.run(read_stream, write_stream, mcp_app.create_initialization_options())
+    finally:
+        tenancy.unpin(pin)
     # Пустой ответ обязателен: без него Starlette попытается вызвать None как
     # ASGI-приложение после закрытия SSE-потока.
     return Response()

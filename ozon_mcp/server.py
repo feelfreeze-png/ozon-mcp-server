@@ -34,7 +34,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from ozon_mcp import shaping, toolsets
+from ozon_mcp import shaping, tenancy, toolsets
 from ozon_mcp.client import OzonSellerClient, OzonPerformanceClient
 
 # ─── Инициализация ────────────────────────────────────────
@@ -873,13 +873,19 @@ def _visible_tools() -> list[Tool]:
     (см. _call_tool_impl), а 149 повторов параметра стоят ~2500 токенов
     контекста в каждой сессии. Как только магазинов становится больше одного,
     параметр возвращается в схемы.
+
+    Исключение — сессия, привязанная к магазину своим токеном: там параметр не
+    возвращается никогда, сколько бы магазинов ни было заведено. Показывать его
+    значило бы предлагать модели выбор, которого у неё нет: подставится всё равно
+    привязанный магазин (tenancy.enforce), а чужие shop_id ей знать незачем.
     """
-    try:
-        from ozon_mcp.settings import load_shops
-        if len(load_shops(DATA_DIR)) > 1:
+    if tenancy.pinned() is None:
+        try:
+            from ozon_mcp.settings import load_shops
+            if len(load_shops(DATA_DIR)) > 1:
+                return TOOLS
+        except Exception:
             return TOOLS
-    except Exception:
-        return TOOLS
 
     visible: list[Tool] = []
     for t in TOOLS:
@@ -922,6 +928,9 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     start = time.monotonic()
     success = True
     error_text = None
+    # Подстановка идёт до всего остального: и статистика, и shaping должны видеть
+    # тот магазин, к которому привязана сессия, а не тот, что назвала модель.
+    arguments = tenancy.enforce(arguments)
     shop_id = arguments.get("shop_id", "")
     token = _CALL_CONTEXT.set((name, arguments))
     try:
@@ -942,6 +951,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 
 async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
+    # Повтор подстановки, а не «на всякий случай»: call_tool — не единственный вход,
+    # эту функцию вызывают напрямую из тестов и из диагностики. Дешевле двух строк
+    # держать инвариант здесь, чем полагаться на дисциплину вызывающих.
+    arguments = tenancy.enforce(arguments)
+
     # Профиль проверяется первым: иначе выключенный инструмент упрётся в ошибку
     # про магазин или ключи, и причина отказа останется невидимой.
     if not toolsets.is_enabled(name):
@@ -950,7 +964,14 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
     # Магазины (без shop_id)
     if name == "ozon_list_shops":
         from ozon_mcp.settings import get_shop_list
-        return _json(get_shop_list(DATA_DIR))
+        shops = get_shop_list(DATA_DIR)
+        # В привязанной сессии соседи не перечисляются: их shop_id клиенту не нужен
+        # (подставляется свой), а знание чужих идентификаторов — готовая половина
+        # атаки, если подстановка когда-нибудь будет обойдена.
+        pinned_shop = tenancy.pinned()
+        if pinned_shop is not None:
+            shops = [s for s in shops if s.get("id") == pinned_shop]
+        return _json(shops)
 
     # Деградации (без shop_id)
     if name == "ozon_degradations":
