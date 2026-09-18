@@ -9,6 +9,13 @@ from typing import Any
 SELLER_BASE = "https://api-seller.ozon.ru"
 PERF_BASE = "https://api-performance.ozon.ru"
 
+# Performance API принимает client_id только в полной форме
+# <id>@advertising.performance.ozon.ru (см. раздел «Авторизация через API-ключ»
+# в docs.ozon.ru/api/performance). Короткую форму он отвергает как
+# `401 invalid_client` — сообщение не называет причину и выглядит как «ключи
+# неверные», из-за чего проверка уходит искать проблему не там.
+PERF_CLIENT_ID_SUFFIX = "@advertising.performance.ozon.ru"
+
 
 class OzonSellerClient:
     """Клиент для Ozon Seller API (товары, цены, акции, финансы, аналитика)."""
@@ -1166,6 +1173,10 @@ class OzonPerformanceClient:
     """
 
     def __init__(self, client_id: str, client_secret: str):
+        # Суффикс дописывается, только если «собачки» нет вовсе: чужую доменную
+        # часть портить нельзя, а короткую форму Ozon не принимает.
+        if client_id and "@" not in client_id:
+            client_id += PERF_CLIENT_ID_SUFFIX
         self.client_id = client_id
         self.client_secret = client_secret
         self._token: str | None = None
