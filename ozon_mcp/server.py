@@ -34,7 +34,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from ozon_mcp import shaping, tenancy, toolsets
+from ozon_mcp import readonly, shaping, tenancy, toolsets
 from ozon_mcp.client import OzonSellerClient, OzonPerformanceClient
 
 # ─── Инициализация ────────────────────────────────────────
@@ -951,6 +951,7 @@ def _enabled_tools(tools: list[Tool]) -> list[Tool]:
     нет». Поэтому список выключенного попадает в описание ozon_list_shops — модель
     может назвать причину, а не выдумать ограничение.
     """
+    tools = [t for t in tools if not readonly.is_blocked(t.name)]
     note = toolsets.availability_note()
     if not note:
         return tools
@@ -1001,7 +1002,13 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
     # держать инвариант здесь, чем полагаться на дисциплину вызывающих.
     arguments = _coerce_numeric_ids(tenancy.enforce(arguments))
 
-    # Профиль проверяется первым: иначе выключенный инструмент упрётся в ошибку
+    # Режим чтения проверяется до всего: инструмент скрыт из каталога, но схема у
+    # клиента могла остаться от прошлой сессии, и вызов дойдёт сюда. Отказ должен
+    # случиться ДО того, как запрос уйдёт в Ozon и спишет деньги.
+    if readonly.is_blocked(name):
+        return [TextContent(type="text", text=readonly.refusal_message(name))]
+
+    # Профиль проверяется следом: иначе выключенный инструмент упрётся в ошибку
     # про магазин или ключи, и причина отказа останется невидимой.
     if not toolsets.is_enabled(name):
         return [TextContent(type="text", text=toolsets.unavailable_message(name))]

@@ -16,6 +16,7 @@ services:
       # а снаружи это выглядит как «патч не работает» / «профили не режут».
       - MCP_CLIENT_TOKENS=${MCP_CLIENT_TOKENS:-}
       - OZON_TOOLSETS=${OZON_TOOLSETS:-}
+      - OZON_READONLY=${OZON_READONLY:-}
       - HEALTH_CHECK_INTERVAL_MIN=${HEALTH_CHECK_INTERVAL_MIN:-30}
       - PORT=8000
     restart: unless-stopped
