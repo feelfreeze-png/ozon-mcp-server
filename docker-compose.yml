@@ -3,7 +3,11 @@ services:
     build: .
     container_name: ozon-mcp-server
     ports:
-      - "8000:8000"
+      # По умолчанию только localhost. Веб-интерфейс сервера не проверяет токен
+      # (см. FORK.md § 1 и docs/ONBOARDING.md § 4.1): на 0.0.0.0 любой, кто дотянулся
+      # до порта, заводит и удаляет магазины. Наружу — только через прокси со своей
+      # авторизацией, и тогда BIND_ADDR задаётся осознанно.
+      - "${BIND_ADDR:-127.0.0.1}:${HOST_PORT:-8000}:8000"
     volumes:
       - ozon_data:/data
     environment:
