@@ -455,6 +455,13 @@ TOOLS = [
           "Stock analytics for specific goods: availability, scarcity, liquidity, 1-100 SKU (аналитика остатков).",
           {"skus": {"type": "array", "items": {"type": "integer"}, "description": "SKUs, 1-100"}},
           ["skus"]),
+    _tool("ozon_placement_zone",
+          "[P1] Warehouse placement zone per SKU before supply (зона размещения): PRODUCTS, SORT, NON_SORT, "
+          "OVERSIZE, JEWELRY, DANGEROUS_GOODS, CLOSED_ZONE. UNRESOLVED and UNSPECIFIED mean Ozon has not "
+          "decided yet — neither is a zone. Read with bids: a SKU in a closed or undecided zone may be "
+          "unsupplyable, so spending on it is premature.",
+          {"skus": {"type": "array", "items": {"type": "integer"}, "description": "SKUs"}},
+          ["skus"]),
     _tool("ozon_product_queries",
           "[P0] Search queries and positions of my goods in Ozon search (Premium). Visibility drives sales (поисковые запросы, позиции).",
           {"date_from": {"type": "string", "description": "YYYY-MM-DD"},
@@ -1226,6 +1233,8 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
         ))
     if name == "ozon_analytics_stocks":
         return _json(await s.analytics_stocks(arguments["skus"]))
+    if name == "ozon_placement_zone":
+        return _json(await s.placement_zone_info(arguments["skus"]))
 
     # === ТОВАРЫ ===
     if name == "ozon_product_list":

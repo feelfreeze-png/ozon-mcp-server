@@ -526,6 +526,22 @@ class OzonSellerClient:
         """POST /v1/analytics/stocks — аналитика по остаткам (1-100 SKU за запрос)."""
         return await self._post("/v1/analytics/stocks", {"skus": [str(s) for s in skus]})
 
+    async def placement_zone_info(self, skus: list[int]) -> dict:
+        """POST /v1/product/placement-zone/info — зоны размещения товаров по SKU.
+
+        Отвечает на вопрос «куда этот товар вообще можно положить» перед поставкой:
+        `PRODUCTS`, `SORT`/`NON_SORT`, `OVERSIZE`, `JEWELRY`, `DANGEROUS_GOODS`,
+        `CLOSED_ZONE`.
+
+        Два значения означают отсутствие ответа, а не зону, и путать их с ней нельзя:
+        `UNRESOLVED` — Ozon зону ещё не определил, `UNSPECIFIED` — не указана.
+
+        SKU передаются числами: схема Ozon объявляет массив integer, в отличие от
+        соседнего /v1/analytics/stocks, который ждёт строки.
+        """
+        return await self._post("/v1/product/placement-zone/info",
+                                {"skus": [int(s) for s in skus]})
+
     async def analytics_turnover_stocks(self, limit: int = 100, offset: int = 0,
                                         skus: list[int] | None = None) -> dict:
         """POST /v1/analytics/turnover/stocks — оборачиваемость и остатки FBO."""

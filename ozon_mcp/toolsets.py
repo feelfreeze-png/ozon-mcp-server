@@ -34,7 +34,9 @@ RULES: tuple[tuple[str, str], ...] = (
     # слова три ручки отгрузок проваливались в core и приезжали даже там, где
     # склады выключены целиком.
     ("orders",    r"^ozon_(order|orders|supply|warehouse|delivery|cancellation|carriage)"),
-    ("analytics", r"^ozon_(analytics|stock_on|search_queries|report|rating)"),
+    # placement_zone — в analytics, а не в catalog: читается вместе с остатками
+    # («можно ли этот товар вообще поставить»), а не с карточкой товара.
+    ("analytics", r"^ozon_(analytics|stock_on|search_queries|report|rating|placement_zone)"),
     ("feedback",  r"^ozon_(review|question|chat|returns)"),
     ("finance",   r"^ozon_finance"),
 )
