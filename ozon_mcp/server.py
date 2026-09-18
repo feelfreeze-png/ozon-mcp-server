@@ -137,6 +137,44 @@ def set_stats_callback(cb: Callable[..., Awaitable[None]]):
 
 SHOP_ID_PROP = {"type": "string"}
 
+# Ozon отдаёт идентификаторы кампаний и SKU СТРОКАМИ ("id":"42297392"), а принимает
+# числами. Модель берёт id из ответа одного инструмента и передаёт в другой — и
+# упирается в отказ схемы на первом же шаге рабочего цикла «посмотрел статистику →
+# поправил ставку». Поэтому схемы принимают оба типа, а приведение к числу делает
+# сервер (см. _coerce_numeric_ids). Требовать от модели угадывать тип нельзя: в
+# ответе Ozon он один, в запросе другой.
+NUMERIC_ID: dict = {"type": ["integer", "string"]}
+NUMERIC_ID_ARRAY: dict = {"type": "array", "items": {"type": ["integer", "string"]}}
+
+# Поля, где идентификатор обязан уехать в Ozon числом. Список закрытый: приводить
+# что попало нельзя — строка из цифр бывает и значением, а не идентификатором.
+_NUMERIC_ID_FIELDS = frozenset({"campaign_id", "campaign_ids", "campaigns", "sku", "skus"})
+
+
+def _coerce_numeric_ids(arguments: dict) -> dict:
+    """Привести идентификаторы-строки к числам.
+
+    Схемы принимают оба типа (NUMERIC_ID), потому что Ozon отдаёт id строками, —
+    но в запрос он их ждёт числами. Приведение здесь избавляет модель от выбора,
+    которого она сделать не может: в ответе один тип, в запросе другой.
+
+    Нецифровые строки не трогаем: пусть отказ придёт от Ozon с его формулировкой,
+    а не превратится в тихий ноль.
+    """
+    out: dict | None = None
+    for key in _NUMERIC_ID_FIELDS & arguments.keys():
+        value = arguments[key]
+        if isinstance(value, str) and value.isdigit():
+            new_value: Any = int(value)
+        elif isinstance(value, list) and any(isinstance(x, str) and x.isdigit() for x in value):
+            new_value = [int(x) if isinstance(x, str) and x.isdigit() else x for x in value]
+        else:
+            continue
+        if out is None:
+            out = dict(arguments)
+        out[key] = new_value
+    return out if out is not None else arguments
+
 
 def _tool(name: str, description: str, properties: dict | None = None, required: list | None = None) -> Tool:
     """Создать Tool с необязательным shop_id.
@@ -342,23 +380,23 @@ TOOLS = [
     # === P0: РЕКЛАМА ===
     _tool("ozon_ad_campaigns",
           "[P0] Ad campaigns: budgets in micro-rubles (1000000 = 1₽), statuses. adv_object_type: SKU | SEARCH_PROMO | BANNER. state: CAMPAIGN_STATE_RUNNING | _STOPPED | _INACTIVE (реклама, кампании).",
-          {"campaign_ids": {"type": "array", "items": {"type": "integer"}, "description": "filter"},
+          {"campaign_ids": {**NUMERIC_ID_ARRAY, "description": "filter"},
            "adv_object_type": {"type": "string", "description": "type filter"},
            "state": {"type": "string", "description": "status filter"}}),
     _tool("ozon_ad_statistics",
           "[P0] Campaign statistics, async Ozon report, up to ~2 min. Limits: ≤10 campaigns, ≤62 days, one report at a time (статистика рекламы).",
-          {"campaigns": {"type": "array", "items": {"type": "integer"}, "description": "campaign ids"},
+          {"campaigns": {**NUMERIC_ID_ARRAY, "description": "campaign ids"},
            "date_from": {"type": "string", "description": "YYYY-MM-DD"},
            "date_to": {"type": "string"},
            "group_by": {"type": "string", "default": "DATE"}},
           ["campaigns", "date_from", "date_to"]),
     _tool("ozon_ad_campaign_stop",
           "[P0] Emergency stop of an ad campaign (остановить рекламу).",
-          {"campaign_id": {"type": "integer"}},
+          {"campaign_id": NUMERIC_ID},
           ["campaign_id"]),
     _tool("ozon_ad_campaign_objects",
           "Goods and bids inside an ad campaign (товары и ставки).",
-          {"campaign_id": {"type": "integer"}},
+          {"campaign_id": NUMERIC_ID},
           ["campaign_id"]),
     _tool("ozon_ad_campaign_create",
           "Create a CPC Trafarety campaign, the only type creatable via API. placement: PLACEMENT_SEARCH_AND_CATEGORY | PLACEMENT_TOP_PROMOTION. strategy: MAX_CLICKS | TOP_MAX_CLICKS | TARGET_BIDS | TOP_PROMOTION | NO_AUTO_STRATEGY. Min budget 2000₽ per SKU; add goods via ozon_ad_products_add (создать кампанию).",
@@ -370,19 +408,19 @@ TOOLS = [
           ["title"]),
     _tool("ozon_ad_campaign_activate",
           "Start an ad campaign (запустить кампанию).",
-          {"campaign_id": {"type": "integer"}},
+          {"campaign_id": NUMERIC_ID},
           ["campaign_id"]),
     _tool("ozon_ad_campaign_bids",
           "[P0] Update goods bids in a campaign. bids: [{sku, bid}], bid in MICRO-RUBLES as a string (10000000 = 10₽) (ставки).",
-          {"campaign_id": {"type": "integer"}, "bids": {"type": "array", "items": {"type": "object"}}},
+          {"campaign_id": NUMERIC_ID, "bids": {"type": "array", "items": {"type": "object"}}},
           ["campaign_id", "bids"]),
     _tool("ozon_ad_campaign_budget",
           "Campaign budget, taken from the campaign list; Ozon has no separate endpoint (бюджет кампании).",
-          {"campaign_id": {"type": "integer"}},
+          {"campaign_id": NUMERIC_ID},
           ["campaign_id"]),
     _tool("ozon_ad_campaign_budget_update",
           "Change campaign budget or period (PATCH). Budgets in RUBLES (изменить бюджет).",
-          {"campaign_id": {"type": "integer"},
+          {"campaign_id": NUMERIC_ID,
            "daily_budget_rub": {"type": "number"},
            "weekly_budget_rub": {"type": "number"},
            "from_date": {"type": "string", "description": "YYYY-MM-DD"},
@@ -390,19 +428,19 @@ TOOLS = [
           ["campaign_id"]),
     _tool("ozon_ad_campaign_products",
           "Goods and bids in a campaign (товары кампании).",
-          {"campaign_id": {"type": "integer"}, "page": {"type": "integer", "default": 1}},
+          {"campaign_id": NUMERIC_ID, "page": {"type": "integer", "default": 1}},
           ["campaign_id"]),
     _tool("ozon_ad_products_add",
           "Add goods to a CPC campaign, max 500. bids: [{sku, bid}] in micro-rubles; without bid the competitive bid applies (добавить товары).",
-          {"campaign_id": {"type": "integer"}, "bids": {"type": "array", "items": {"type": "object"}}},
+          {"campaign_id": NUMERIC_ID, "bids": {"type": "array", "items": {"type": "object"}}},
           ["campaign_id", "bids"]),
     _tool("ozon_ad_products_delete",
           "Remove goods from a campaign (убрать товары).",
-          {"campaign_id": {"type": "integer"}, "skus": {"type": "array", "items": {"type": "integer"}}},
+          {"campaign_id": NUMERIC_ID, "skus": {"type": "array", "items": {"type": "integer"}}},
           ["campaign_id", "skus"]),
     _tool("ozon_ad_bids_competitive",
           "Competitive bids by SKU in a campaign, max 200 (конкурентные ставки).",
-          {"campaign_id": {"type": "integer"}, "skus": {"type": "array", "items": {"type": "integer"}}},
+          {"campaign_id": NUMERIC_ID, "skus": {"type": "array", "items": {"type": "integer"}}},
           ["campaign_id", "skus"]),
     _tool("ozon_ad_min_bids",
           "Minimum bids by SKU. payment_type: CPC | CPO | CPC_TOP (минимальные ставки).",
@@ -426,15 +464,15 @@ TOOLS = [
           ["skus"]),
     _tool("ozon_ad_statistics_daily",
           "Daily ad statistics (ежедневная статистика).",
-          {"campaigns": {"type": "array", "items": {"type": "integer"}}, "date_from": {"type": "string"}, "date_to": {"type": "string"}},
+          {"campaigns": NUMERIC_ID_ARRAY, "date_from": {"type": "string"}, "date_to": {"type": "string"}},
           ["campaigns", "date_from", "date_to"]),
     _tool("ozon_ad_statistics_expenses",
           "Ad campaign spend (расходы на рекламу).",
-          {"campaigns": {"type": "array", "items": {"type": "integer"}}, "date_from": {"type": "string"}, "date_to": {"type": "string"}},
+          {"campaigns": NUMERIC_ID_ARRAY, "date_from": {"type": "string"}, "date_to": {"type": "string"}},
           ["campaigns", "date_from", "date_to"]),
     _tool("ozon_ad_statistics_products",
           "[P0] CPC campaign stats per product: spend, CTR, CPC, orders, ДРР. Synchronous (статистика по товарам).",
-          {"campaigns": {"type": "array", "items": {"type": "integer"}},
+          {"campaigns": NUMERIC_ID_ARRAY,
            "date_from": {"type": "string"}, "date_to": {"type": "string"}},
           ["campaigns", "date_from", "date_to"]),
     _tool("ozon_ad_balance",
@@ -453,14 +491,14 @@ TOOLS = [
           {"limit": {"type": "integer", "default": 100}, "offset": {"type": "integer", "default": 0}}),
     _tool("ozon_analytics_stocks",
           "Stock analytics for specific goods: availability, scarcity, liquidity, 1-100 SKU (аналитика остатков).",
-          {"skus": {"type": "array", "items": {"type": "integer"}, "description": "SKUs, 1-100"}},
+          {"skus": {**NUMERIC_ID_ARRAY, "description": "SKUs, 1-100"}},
           ["skus"]),
     _tool("ozon_placement_zone",
           "[P1] Warehouse placement zone per SKU before supply (зона размещения): PRODUCTS, SORT, NON_SORT, "
           "OVERSIZE, JEWELRY, DANGEROUS_GOODS, CLOSED_ZONE. UNRESOLVED and UNSPECIFIED mean Ozon has not "
           "decided yet — neither is a zone. Read with bids: a SKU in a closed or undecided zone may be "
           "unsupplyable, so spending on it is premature.",
-          {"skus": {"type": "array", "items": {"type": "integer"}, "description": "SKUs"}},
+          {"skus": {**NUMERIC_ID_ARRAY, "description": "SKUs"}},
           ["skus"]),
     _tool("ozon_product_queries",
           "[P0] Search queries and positions of my goods in Ozon search (Premium). Visibility drives sales (поисковые запросы, позиции).",
@@ -937,7 +975,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     error_text = None
     # Подстановка идёт до всего остального: и статистика, и shaping должны видеть
     # тот магазин, к которому привязана сессия, а не тот, что назвала модель.
-    arguments = tenancy.enforce(arguments)
+    arguments = _coerce_numeric_ids(tenancy.enforce(arguments))
     shop_id = arguments.get("shop_id", "")
     token = _CALL_CONTEXT.set((name, arguments))
     try:
@@ -961,7 +999,7 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
     # Повтор подстановки, а не «на всякий случай»: call_tool — не единственный вход,
     # эту функцию вызывают напрямую из тестов и из диагностики. Дешевле двух строк
     # держать инвариант здесь, чем полагаться на дисциплину вызывающих.
-    arguments = tenancy.enforce(arguments)
+    arguments = _coerce_numeric_ids(tenancy.enforce(arguments))
 
     # Профиль проверяется первым: иначе выключенный инструмент упрётся в ошибку
     # про магазин или ключи, и причина отказа останется невидимой.

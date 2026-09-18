@@ -48,7 +48,9 @@ def test_tool_is_registered_and_requires_skus():
     tool = next((t for t in TOOLS if t.name == "ozon_placement_zone"), None)
     assert tool is not None, "инструмент не объявлен в TOOLS"
     assert tool.inputSchema.get("required") == ["skus"]
-    assert tool.inputSchema["properties"]["skus"]["items"]["type"] == "integer"
+    # Тип оба: Ozon отдаёт SKU строками, а принимает числами — приведение
+    # делает сервер, см. tests/test_numeric_ids.py
+    assert set(tool.inputSchema["properties"]["skus"]["items"]["type"]) == {"integer", "string"}
 
 
 def test_tool_lives_in_analytics_profile():
