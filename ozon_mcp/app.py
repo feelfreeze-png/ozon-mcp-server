@@ -83,6 +83,12 @@ async def _health_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _health_task
+    if not ADMIN_TOKEN:
+        # Громко и на старте: молчаливо открытая админка — это то, что нельзя заметить
+        # по поведению. Сервер работает одинаково и с токеном, и без.
+        print("ВНИМАНИЕ: ADMIN_TOKEN не задан — веб-интерфейс открыт всем, кто дотянулся "
+              "до порта: список магазинов, заведение и удаление, статистика арендаторов. "
+              "Допустимо только на localhost в закрытом контуре.", flush=True)
     await stats.init_db(DATA_DIR)
     set_stats_callback(stats.record_call)
     if HEALTH_CHECK_INTERVAL_MIN > 0:
@@ -128,6 +134,50 @@ def _resolve_mcp_auth(request: Request) -> tuple[bool, str | None]:
 def _check_mcp_auth(request: Request) -> bool:
     """Проверка Bearer-токена для /sse и /messages. Без MCP_AUTH_TOKEN — пропуск."""
     return _resolve_mcp_auth(request)[0]
+
+
+# ─── Авторизация веб-интерфейса ─────────────────────────────
+#
+# До появления ADMIN_TOKEN токен проверяли ТОЛЬКО /sse и /messages, а весь веб-интерфейс
+# был открыт: `GET /shops` отдавал список магазинов, `POST /api/shops` заводил новый,
+# `DELETE /api/shops/{id}` удалял, `/api/stats` показывал вызовы всех арендаторов.
+# Привязка клиента к магазину этого не закрывает и не пытается — она про MCP-сессию,
+# а не про админку: сосед не стал бы подбирать shop_id, он открыл бы /shops.
+
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
+
+# Пути, которых охрана не касается, и почему именно они:
+#   /sse, /messages — у них свой механизм (MCP_CLIENT_TOKENS / MCP_AUTH_TOKEN), и
+#     закрывать их вторым замком значило бы требовать от MCP-клиента админский токен;
+#   /api/health — его дёргает healthcheck самого контейнера (docker-compose.yml), у
+#     которого токена нет и быть не должно. Поэтому без токена он отдаёт сокращённый
+#     ответ: живость видно, состав проверок — нет.
+_MCP_PREFIXES = ("/sse", "/messages")
+_LIVENESS_PATH = "/api/health"
+
+
+def _check_admin_auth(request: Request) -> bool:
+    """Допущен ли запрос к админской поверхности."""
+    if not ADMIN_TOKEN:
+        return True
+    return secrets.compare_digest(_request_token(request), ADMIN_TOKEN)
+
+
+@fastapi_app.middleware("http")
+async def _guard_admin_surface(request: Request, call_next):
+    """Закрыть весь веб-интерфейс, кроме двух намеренных исключений.
+
+    Охрана стоит списком ИСКЛЮЧЕНИЙ, а не списком защищаемых маршрутов: новый
+    эндпоинт тогда защищён по умолчанию, а не до тех пор, пока про него не забыли.
+    Именно забывчивость и сделала эту дыру — `/api/key-expiry` добавлялся уже после
+    того, как стало известно, что админка открыта.
+    """
+    path = request.url.path
+    if not ADMIN_TOKEN or path.startswith(_MCP_PREFIXES) or path == _LIVENESS_PATH:
+        return await call_next(request)
+    if _check_admin_auth(request):
+        return await call_next(request)
+    return Response("Unauthorized", status_code=401)
 
 
 def _is_live_session(request: Request) -> bool:
@@ -408,13 +458,22 @@ async def key_expiry():
 
 
 @fastapi_app.get("/api/health")
-async def health():
-    """Здоровье самого сервиса + сводка последних проверок Ozon API."""
+async def health(request: Request):
+    """Здоровье самого сервиса + сводка последних проверок Ozon API.
+
+    Единственный маршрут, доступный без админского токена: его дёргает healthcheck
+    контейнера, у которого токена нет и быть не должно. Поэтому без токена ответ
+    сокращён до живости — состав проверок и перечень деградаций называют магазины и
+    подробности отказов, и отдавать их кому угодно незачем.
+    """
+    if not _check_admin_auth(request):
+        return JSONResponse({"status": "ok"})
     history = await stats.get_health_history(limit=5)
     degradations = await stats.get_tool_degradations()
     return JSONResponse({
         "status": "ok",
         "auth_enabled": bool(MCP_AUTH_TOKEN),
+        "admin_auth_enabled": bool(ADMIN_TOKEN),
         "health_check_interval_min": HEALTH_CHECK_INTERVAL_MIN,
         "recent_checks": history,
         "degraded_tools": degradations,

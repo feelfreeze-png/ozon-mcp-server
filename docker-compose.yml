@@ -16,8 +16,9 @@ services:
       - OZON_PERF_CLIENT_ID=${OZON_PERF_CLIENT_ID:-}
       - OZON_PERF_CLIENT_SECRET=${OZON_PERF_CLIENT_SECRET:-}
       - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:-}
-      # Без этих двух строк переменную из .env контейнер молча не увидит,
-      # а снаружи это выглядит как «патч не работает» / «профили не режут».
+      # Без проброса переменную из .env контейнер молча не увидит, а снаружи это
+      # выглядит как «патч не работает» / «профили не режут» / «админка всё ещё открыта».
+      - ADMIN_TOKEN=${ADMIN_TOKEN:-}
       - MCP_CLIENT_TOKENS=${MCP_CLIENT_TOKENS:-}
       - OZON_TOOLSETS=${OZON_TOOLSETS:-}
       - OZON_READONLY=${OZON_READONLY:-}
