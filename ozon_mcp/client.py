@@ -60,6 +60,17 @@ class OzonSellerClient:
     async def _get(self, path: str, params: dict | None = None) -> dict:
         return await self._send("GET", path, params=params)
 
+    # ── Аккаунт ────────────────────────────────────────────
+    async def roles(self) -> dict:
+        """POST /v1/roles — роли ключа и срок его действия.
+
+        Отвечает полями `roles` (с перечнем разрешённых методов) и `expires_at`
+        в ISO-8601 с `Z`. Ключ Seller API живёт **три месяца**, после чего все
+        вызовы начинают падать — молча с точки зрения любого нашего механизма.
+        Отсюда и берётся срок для сторожа.
+        """
+        return await self._post("/v1/roles", {})
+
     # ── Акции ──────────────────────────────────────────────
     async def actions_list(self) -> dict:
         """GET /v1/actions — список доступных акций."""

@@ -353,6 +353,60 @@ async def api_stats(shop: str | None = None):
     return JSONResponse(await stats.get_summary(shop_id=shop))
 
 
+@fastapi_app.get("/api/key-expiry")
+async def key_expiry():
+    """Срок жизни Seller-ключей всех магазинов.
+
+    Ключ Seller API живёт три месяца, после чего вызовы начинают падать — молча с
+    точки зрения любого внешнего механизма. Эндпоинт существует, чтобы сторож снаружи
+    мог узнать срок, **не получая самих ключей**: они остаются в шифрованном сторе, а
+    наружу уходит только дата.
+
+    ⚠️ `state` различает три вещи, и это главное свойство ответа:
+    `ok` — срок известен и не близок; `expired` — истёк; `unknown` — **спросить не
+    удалось**. Последнее нельзя сворачивать в «наверное, ок»: сеть, протухший ключ и
+    смена схемы ответа выглядят одинаково молча, и именно так выглядела бы авария,
+    ради которой сторож и заводится.
+    """
+    import datetime
+
+    shops = cfg.load_shops(DATA_DIR)
+    out: list[dict] = []
+    for shop_id, shop in shops.items():
+        if not shop.get("ozon_client_id") or not shop.get("ozon_api_key"):
+            out.append({"shop_id": shop_id, "state": "unknown",
+                        "reason": "Seller API: ключи не заданы"})
+            continue
+        client = get_seller_for_shop(shop_id)
+        try:
+            data = await client.roles()
+        except Exception as e:
+            out.append({"shop_id": shop_id, "state": "unknown",
+                        "reason": f"{type(e).__name__}: {e}"})
+            continue
+        raw = data.get("expires_at")
+        if not raw:
+            out.append({"shop_id": shop_id, "state": "unknown",
+                        "reason": "в ответе /v1/roles нет expires_at"})
+            continue
+        try:
+            when = datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            out.append({"shop_id": shop_id, "state": "unknown",
+                        "reason": f"не разобрана дата: {raw!r}"})
+            continue
+        left = when - datetime.datetime.now(datetime.timezone.utc)
+        days = left.days
+        out.append({
+            "shop_id": shop_id,
+            "state": "ok" if days > 0 else "expired",
+            "expires_at": when.isoformat(),
+            "days_left": days,
+            "roles": [r.get("name") for r in data.get("roles", []) if isinstance(r, dict)],
+        })
+    return JSONResponse({"shops": out})
+
+
 @fastapi_app.get("/api/health")
 async def health():
     """Здоровье самого сервиса + сводка последних проверок Ozon API."""
