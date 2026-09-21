@@ -129,6 +129,14 @@ def truncation_note(name: str, arguments: dict, data: Any) -> str | None:
     items = _dig(data, VIEWS[name][0]) if name in VIEWS else None
     if not isinstance(items, list):
         items = data if isinstance(data, list) else None
+    if not isinstance(items, list):
+        # ⚠️ Раньше на этом месте стоял отказ, и предупреждение работало только для
+        # инструментов с пресетом да для массива на верхнем уровне. У всех остальных —
+        # а это большинство ручек Ozon, отдающих `{"result": {"items": [...]}}` —
+        # «вернулось ровно `limit`» проходило молча. Берём самый длинный список тем же
+        # помощником, которым его находит проверка размера: иначе два механизма смотрят
+        # на разные части одного ответа.
+        _, items = _longest_list(data)
     if not isinstance(items, list) or len(items) < limit:
         return None
     return (f'Вернулось ровно {limit} записей — данные почти наверняка неполные. '
@@ -168,21 +176,63 @@ def guard_size(data: Any, max_chars: int = MAX_RESPONSE_CHARS) -> tuple[Any, str
     return _put(data, target_path, target[:keep]), note
 
 
+#: Ключ-обёртка для ответов, у которых верхний уровень — массив. Оборачиваем ТОЛЬКО
+#: усечённые: менять путь к данным в обычном случае незачем, а в усечённом изменившаяся
+#: форма и есть сообщение — «это не весь ответ».
+WRAPPED_ITEMS_KEY = "items"
+
+
+def mark_truncated(data: Any, *, total: int, shown: int) -> Any:
+    """Вписать признак усечения ВНУТРЬ JSON.
+
+    🔴 Раньше предупреждение уходило отдельным текстовым блоком. Человек его видел,
+    а программа — нет: сборщик читает JSON, получает меньше записей и не узнаёт об этом.
+    Неполный срез, принятый за полный, даёт правдоподобный и неверный вывод по всему
+    ассортименту.
+
+    Для объекта признак кладётся полями верхнего уровня. Для массива объект-обёртка
+    появляется **только при усечении**: в обычном случае пути к данным не меняются.
+    """
+    fields = {"_truncated": True, "_total": total, "_shown": shown}
+    if isinstance(data, dict):
+        return {**data, **fields}
+    return {**fields, WRAPPED_ITEMS_KEY: data}
+
+
 def shape(name: str, arguments: dict, data: Any) -> tuple[Any, list[str]]:
-    """Применить пресет, проверить усечение и размер. Возвращает (данные, заметки)."""
+    """Применить пресет, проверить усечение и размер. Возвращает (данные, заметки).
+
+    Признаки усечения вписываются в сами данные, а заметки для человека сохраняются:
+    у них разные читатели, и подменять одно другим нельзя.
+    """
     notes: list[str] = []
     view = arguments.get("view") or ("compact" if name in COMPACT_BY_DEFAULT else "full")
 
     data, note = apply_view(name, data, view)
     if note:
         notes.append(note)
+        if isinstance(data, dict):
+            # Пресет режет ПОЛЯ, а не записи. Для сборщика это тоже неполнота, просто
+            # другого рода: он не увидит поля, которого ждёт, и решит, что Ozon его
+            # не отдал.
+            data = {**data, "_view": view}
 
     note = truncation_note(name, arguments, data)
     if note:
         notes.append(note)
+        limit = arguments.get("limit")
+        if isinstance(data, dict):
+            # Здесь не усечение, а подозрение: записей ровно столько, сколько
+            # запрошено. Отличается от `_truncated` тем, что полное число неизвестно.
+            data = {**data, "_maybe_incomplete": True, "_limit": limit}
 
+    before_path, before = _longest_list(data)
     data, note = guard_size(data)
     if note:
         notes.append(note)
+        after = _dig(data, before_path) if before_path else (
+            data if isinstance(data, list) else None)
+        if isinstance(before, list) and isinstance(after, list) and len(after) < len(before):
+            data = mark_truncated(data, total=len(before), shown=len(after))
 
     return data, notes

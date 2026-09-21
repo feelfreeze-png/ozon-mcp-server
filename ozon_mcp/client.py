@@ -6,7 +6,7 @@ import re
 import httpx
 from datetime import date as _date, datetime, timedelta, timezone
 
-from . import limits, numbers, timezones
+from . import failures, limits, numbers, timezones
 from typing import Any
 
 SELLER_BASE = "https://api-seller.ozon.ru"
@@ -1225,17 +1225,26 @@ class OzonSellerClient:
 
     # ── Компания ───────────────────────────────────────────
     async def company_info(self) -> dict:
-        return {"error": "Endpoint /v1/company/info не существует в публичном Ozon API."}
+        raise failures.EndpointRetired(
+            "метода /v1/company/info в публичном Ozon API нет",
+            endpoint="/v1/company/info")
 
     async def company_tariffs(self) -> dict:
-        return {"error": "Endpoint /v1/company/tariffs не существует в публичном Ozon API."}
+        raise failures.EndpointRetired(
+            "метода /v1/company/tariffs в публичном Ozon API нет",
+            endpoint="/v1/company/tariffs")
 
     # ── Сертификаты ────────────────────────────────────────
     async def certificate_list(self, page: int = 1, page_size: int = 100, status: str = "") -> dict:
-        return {"error": "Endpoint /v1/certificate/list не существует в публичном Ozon API. Используйте ozon_brand_certificates."}
+        raise failures.EndpointRetired(
+            "метода /v1/certificate/list в публичном Ozon API нет — "
+            "сертификаты бренда отдаёт ozon_brand_certificates",
+            endpoint="/v1/certificate/list")
 
     async def certificate_info(self, certificate_id: int) -> dict:
-        return {"error": "Endpoint /v1/certificate/info не существует в публичном Ozon API."}
+        raise failures.EndpointRetired(
+            "метода /v1/certificate/info в публичном Ozon API нет",
+            endpoint="/v1/certificate/info")
 
     # ── Архив ──────────────────────────────────────────────
     async def product_archive(self, product_id: list[int]) -> dict:
@@ -1754,7 +1763,10 @@ class OzonPerformanceClient:
 
     # ── Баланс ─────────────────────────────────────────────
     async def balance(self) -> dict:
-        return {"error": "Официального метода баланса в Performance API нет. Расход с абонентского счёта виден в ozon_ad_statistics_expenses."}
+        raise failures.EndpointRetired(
+            "официального метода баланса в Performance API нет; расход с абонентского "
+            "счёта виден в ozon_ad_statistics_expenses",
+            endpoint="/api/client/balance")
 
     async def close(self):
         await self._http.aclose()

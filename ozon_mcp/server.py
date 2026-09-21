@@ -34,7 +34,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from ozon_mcp import readonly, shaping, tenancy, toolsets
+from ozon_mcp import failures, readonly, shaping, tenancy, toolsets
 from ozon_mcp.client import (
     OzonSellerClient, OzonPerformanceClient, normalize_sku_rows,
 )
@@ -484,7 +484,10 @@ TOOLS = [
           {"campaigns": NUMERIC_ID_ARRAY, "date_from": {"type": "string"}, "date_to": {"type": "string"}},
           ["campaigns", "date_from", "date_to"]),
     _tool("ozon_ad_statistics_products",
-          "[P0] CPC campaign stats per product: spend, CTR, CPC, orders, ДРР. Synchronous (статистика по товарам).",
+          "CPC campaign totals — NOT per SKU, despite the name. Measured 20.09.2026: the "
+          "response carries no 'sku' and no 'date' field, only per-campaign aggregates. "
+          "For spend and orders BY SKU use ozon_ad_statistics_products_sku "
+          "(итоги по кампаниям; разреза по товарам здесь нет).",
           {"campaigns": NUMERIC_ID_ARRAY,
            "date_from": {"type": "string"}, "date_to": {"type": "string"}},
           ["campaigns", "date_from", "date_to"]),
@@ -1015,7 +1018,16 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     except Exception as e:
         success = False
         error_text = f"{type(e).__name__}: {e}"
-        return [TextContent(type="text", text=f"Ошибка: {error_text}")]
+        # Отказ уходит СТРУКТУРОЙ, а текст для человека — отдельным блоком рядом.
+        # Плоская строка `Ошибка: …` читателю-программе не годится: он либо падает
+        # на разборе, либо записывает её как пустой результат, а «пусто» у Ozon
+        # означает минимум три разных вещи.
+        envelope = failures.envelope(e)
+        return [
+            TextContent(type="text", text=json.dumps(
+                envelope, ensure_ascii=False, separators=(",", ":"), default=str)),
+            TextContent(type="text", text=failures.human_text(envelope)),
+        ]
     finally:
         _CALL_CONTEXT.reset(token)
         duration_ms = (time.monotonic() - start) * 1000
