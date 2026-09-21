@@ -18,6 +18,9 @@ POST /v1/roles возвращает `expires_at` (например, "2026-11-09T
 
 import time
 import asyncio
+from datetime import datetime as _datetime, timedelta as _timedelta
+
+from . import timezones
 from typing import Any
 
 import httpx
@@ -57,11 +60,24 @@ async def check_hosts() -> list[dict[str, Any]]:
 # ─── Пробы Seller API ────────────────────────────────────────
 
 def _today() -> str:
-    return time.strftime("%Y-%m-%d")
+    """Сегодня по МСК — в тех же сутках, в которых Ozon нарезает рекламу.
+
+    ⚠️ Было `time.strftime("%Y-%m-%d")` — локальное время хоста. На машине в Ташкенте
+    (UTC+5) это давало дату на пять часов вперёд, и совпадало с московской ровно
+    настолько, насколько совпадают часовые пояса.
+    """
+    return timezones.today_msk()
 
 
 def _iso(days_ago: int = 0) -> str:
-    return time.strftime("%Y-%m-%dT00:00:00Z", time.localtime(time.time() - days_ago * 86400))
+    """Метка времени N суток назад, в МСК и с поясом в самой строке.
+
+    ⚠️ Было `time.strftime("%Y-%m-%dT00:00:00Z", time.localtime(...))` — значение
+    бралось по локальному времени хоста, а подписывалось буквой `Z`, то есть UTC.
+    Подпись противоречила значению, и оба выглядели правдоподобно.
+    """
+    day = timezones.now_msk().date() - _timedelta(days=days_ago)
+    return _datetime.combine(day, _datetime.min.time(), tzinfo=timezones.MSK).isoformat()
 
 
 def build_probes(seller) -> list[tuple[str, str, Any]]:

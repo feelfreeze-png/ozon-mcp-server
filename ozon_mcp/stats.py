@@ -4,6 +4,8 @@ import aiosqlite
 from pathlib import Path
 from datetime import datetime
 
+from . import timezones
+
 _db: aiosqlite.Connection | None = None
 
 
@@ -213,8 +215,12 @@ async def get_summary(shop_id: str | None = None) -> dict:
         for r in await cur.fetchall()
     ]
 
-    # За сегодня
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    # За сегодня — по МОСКОВСКИМ суткам.
+    # ⚠️ Было `datetime.utcnow().strftime("%Y-%m-%d")`, то есть сегодня по UTC. С полуночи
+    # до трёх ночи по Москве счётчик показывал вчерашний день и выглядел при этом
+    # совершенно нормально. `called_at` хранится в UTC (SQLite CURRENT_TIMESTAMP),
+    # поэтому границу московских суток переводим в UTC, а не сравниваем разные шкалы.
+    today = timezones.msk_day_start_utc().strftime("%Y-%m-%d %H:%M:%S")
     cur = await _db.execute(
         f"SELECT COUNT(*) as cnt FROM tool_calls {where} {'AND' if where else 'WHERE'} called_at >= ?",
         (*params, today),

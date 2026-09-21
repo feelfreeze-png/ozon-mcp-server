@@ -4,6 +4,8 @@ import asyncio
 import re
 import httpx
 from datetime import datetime, timedelta, timezone
+
+from . import timezones
 from typing import Any
 
 SELLER_BASE = "https://api-seller.ozon.ru"
@@ -1392,11 +1394,13 @@ class OzonPerformanceClient:
         Лимиты: ≤10 кампаний, период ≤62 дня, 1 одновременная выгрузка на аккаунт.
         """
         import asyncio as _aio
-        submit = await self._post("/api/client/statistics/json", {
+        body = {
             "campaigns": [str(c) for c in campaigns],
             "dateFrom": date_from, "dateTo": date_to,
             "groupBy": group_by,
-        })
+        }
+        timezones.check_statistics_period(body)
+        submit = await self._post("/api/client/statistics/json", body)
         uuid = submit.get("UUID")
         if not uuid:
             return submit
@@ -1419,6 +1423,7 @@ class OzonPerformanceClient:
     async def statistics_daily(self, campaigns: list[int] | None, date_from: str, date_to: str) -> dict:
         """GET /api/client/statistics/daily/json — дневная статистика (синхронно)."""
         params: dict[str, Any] = {"dateFrom": date_from, "dateTo": date_to}
+        timezones.check_statistics_period(params)
         if campaigns:
             params["campaignIds"] = [str(c) for c in campaigns]
         return await self._get("/api/client/statistics/daily/json", params)
@@ -1426,16 +1431,19 @@ class OzonPerformanceClient:
     async def statistics_expenses(self, campaigns: list[int] | None, date_from: str, date_to: str) -> dict:
         """GET /api/client/statistics/expense/json — расходы по кампаниям (синхронно)."""
         params: dict[str, Any] = {"dateFrom": date_from, "dateTo": date_to}
+        timezones.check_statistics_period(params)
         if campaigns:
             params["campaignIds"] = [str(c) for c in campaigns]
         return await self._get("/api/client/statistics/expense/json", params)
 
     async def statistics_products(self, campaigns: list[int], date_from: str, date_to: str) -> dict:
         """GET /api/client/statistics/campaign/product/json — статистика CPC-кампаний по товарам: расход, CTR, CPC, заказы, ДРР."""
-        return await self._get("/api/client/statistics/campaign/product/json", {
+        params = {
             "campaignIds": [str(c) for c in campaigns],
             "dateFrom": date_from, "dateTo": date_to,
-        })
+        }
+        timezones.check_statistics_period(params)
+        return await self._get("/api/client/statistics/campaign/product/json", params)
 
     # ── Баланс ─────────────────────────────────────────────
     async def balance(self) -> dict:
