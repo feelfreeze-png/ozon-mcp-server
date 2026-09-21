@@ -182,3 +182,87 @@ async def test_a_failing_chunk_is_not_swallowed_into_a_short_answer():
     client._post = flaky
     with pytest.raises(RuntimeError):
         await client.statistics_products_sku_all(list(range(90)), tz.yesterday_msk(), pause_s=0)
+
+
+# ── Единицы бюджета: замер отложен до этапа 2 ────────────────────────────────
+
+
+def test_budget_conversion_is_refused_until_measured(monkeypatch):
+    """🔴 Решение владельца 21.09.2026 — отложить замер до этапа 2.
+
+    Отложить замер и оставить молчаливое `* 1_000_000` значило бы отложить не вопрос,
+    а его последствие: ошибка в единице бюджета в тысячу раз неотличима от верной
+    настройки ничем, кроме счёта в конце недели.
+    """
+    monkeypatch.delenv(limits.BUDGET_UNIT_ENV, raising=False)
+    with pytest.raises(limits.UnmeasuredUnitError) as exc:
+        limits.budget_to_api(1234, field="weeklyBudget")
+    assert "weeklyBudget" in str(exc.value)
+
+
+def test_the_refusal_names_the_experiment_that_settles_it():
+    """Отказ обязан говорить, ЧТО сделать, иначе он читается как «нельзя никогда»."""
+    with pytest.raises(limits.UnmeasuredUnitError) as exc:
+        limits.budget_to_api(1234, field="dailyBudget")
+    text = str(exc.value)
+    assert "1234000000" in text and "1234000000000" in text
+    assert "прочитать обратно" in text
+
+
+def test_a_measured_unit_converts(monkeypatch):
+    monkeypatch.setenv(limits.BUDGET_UNIT_ENV, "1000000")
+    assert limits.budget_to_api(1234, field="weeklyBudget") == "1234000000"
+    monkeypatch.setenv(limits.BUDGET_UNIT_ENV, "1000000000")
+    assert limits.budget_to_api(1234, field="weeklyBudget") == "1234000000000"
+
+
+@pytest.mark.parametrize("value", ["микрорубли", "", "  ", "1000", "1e6", "10000000"])
+def test_anything_but_the_two_candidates_is_refused(monkeypatch, value):
+    """Замер обязан дать один из двух. Другое значение — опечатка ценой в порядок."""
+    monkeypatch.setenv(limits.BUDGET_UNIT_ENV, value)
+    with pytest.raises(limits.UnmeasuredUnitError):
+        limits.budget_to_api(1234, field="weeklyBudget")
+
+
+@pytest.mark.asyncio
+async def test_campaign_create_cannot_slip_a_budget_through(monkeypatch):
+    """Сторож против возврата: оба метода обязаны ходить через один отказ."""
+    from ozon_mcp.client import OzonPerformanceClient
+
+    monkeypatch.delenv(limits.BUDGET_UNIT_ENV, raising=False)
+    client = OzonPerformanceClient.__new__(OzonPerformanceClient)
+
+    async def must_not_be_called(*args, **kwargs):
+        raise AssertionError("запрос ушёл в Ozon с непроверенной единицей бюджета")
+
+    client._post = must_not_be_called
+    with pytest.raises(limits.UnmeasuredUnitError):
+        await client.campaign_create("проба", weekly_budget_rub=1234)
+
+
+@pytest.mark.asyncio
+async def test_campaign_update_cannot_slip_a_budget_through(monkeypatch):
+    """⚠️ Второе место. Документация утверждала, что оно одно."""
+    from ozon_mcp.client import OzonPerformanceClient
+
+    monkeypatch.delenv(limits.BUDGET_UNIT_ENV, raising=False)
+    client = OzonPerformanceClient.__new__(OzonPerformanceClient)
+
+    async def must_not_be_called(*args, **kwargs):
+        raise AssertionError("запрос ушёл в Ozon с непроверенной единицей бюджета")
+
+    client._ensure_token = must_not_be_called
+    with pytest.raises(limits.UnmeasuredUnitError):
+        await client.campaign_update(42708950, daily_budget_rub=1234)
+
+
+def test_no_bare_budget_conversion_is_left_in_the_client():
+    """Сторож по исходнику: молчаливое умножение бюджета не должно вернуться."""
+    import pathlib
+    import re
+
+    source = pathlib.Path(__file__).resolve().parents[1] / "ozon_mcp" / "client.py"
+    text = source.read_text(encoding="utf-8")
+    offenders = [line.strip() for line in text.splitlines()
+                 if re.search(r"[Bb]udget.*1_000_000|1_000_000.*[Bb]udget", line)]
+    assert not offenders, f"бюджет снова преобразуется напрямую: {offenders}"

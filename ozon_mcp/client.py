@@ -1514,7 +1514,10 @@ class OzonPerformanceClient:
 
         placement: PLACEMENT_SEARCH_AND_CATEGORY (поиск+рекомендации) | PLACEMENT_TOP_PROMOTION (вывод в топ).
         autopilot_strategy: MAX_CLICKS | TOP_MAX_CLICKS | TARGET_BIDS | TOP_PROMOTION | NO_AUTO_STRATEGY.
-        Бюджеты в РУБЛЯХ (конвертируются в микрорубли). Мин. бюджет с 09.2025: 2000 ₽ × SKU.
+        🔴 Бюджеты принимаются в РУБЛЯХ, но единица Ozon для них **не замерена**, и
+        преобразование отвергается — `limits.budget_to_api`. Прежняя редакция докстринга
+        обещала «конвертируются в микрорубли»: это было допущение, а не замер.
+        Мин. бюджет с 09.2025: 2000 ₽ × SKU — число из справочника, тоже не проверено.
         """
         body: dict[str, Any] = {
             "title": title,
@@ -1522,9 +1525,9 @@ class OzonPerformanceClient:
             "productAutopilotStrategy": autopilot_strategy,
         }
         if daily_budget_rub:
-            body["dailyBudget"] = str(int(daily_budget_rub * 1_000_000))
+            body["dailyBudget"] = limits.budget_to_api(daily_budget_rub, field="dailyBudget")
         if weekly_budget_rub:
-            body["weeklyBudget"] = str(int(weekly_budget_rub * 1_000_000))
+            body["weeklyBudget"] = limits.budget_to_api(weekly_budget_rub, field="weeklyBudget")
         if from_date:
             body["fromDate"] = from_date
         if to_date:
@@ -1534,12 +1537,17 @@ class OzonPerformanceClient:
     async def campaign_update(self, campaign_id: int, daily_budget_rub: float | None = None,
                               weekly_budget_rub: float | None = None,
                               from_date: str = "", to_date: str = "") -> dict:
-        """PATCH /api/client/campaign/{id} — изменить бюджет/период кампании."""
+        """PATCH /api/client/campaign/{id} — изменить бюджет/период кампании.
+
+        🔴 Второе место, где бюджет переводится из рублей. `docs/UNITS-bids-budgets.md`
+        до 21.09.2026 утверждал, что такое место одно, — пересчёт показал два.
+        Единица не замерена, преобразование отвергается (`limits.budget_to_api`).
+        """
         body: dict[str, Any] = {}
         if daily_budget_rub is not None:
-            body["dailyBudget"] = str(int(daily_budget_rub * 1_000_000))
+            body["dailyBudget"] = limits.budget_to_api(daily_budget_rub, field="dailyBudget")
         if weekly_budget_rub is not None:
-            body["weeklyBudget"] = str(int(weekly_budget_rub * 1_000_000))
+            body["weeklyBudget"] = limits.budget_to_api(weekly_budget_rub, field="weeklyBudget")
         if from_date:
             body["fromDate"] = from_date
         if to_date:
