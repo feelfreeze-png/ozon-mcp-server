@@ -24,7 +24,8 @@ import pytest_asyncio
 
 from ozon_mcp import series
 
-TABLES = {"ad_daily", "stock_daily", "product", "product_sku", "action_log"}
+TABLES = {"ad_daily", "stock_daily", "product", "product_sku", "action_log",
+          "collection_run"}
 
 # Состав первичных ключей — не украшение, а основание приёмки C4 («повторный сбор
 # перезаписывает, а не задваивает»). Сужение ключа даёт неверные деньги: один SKU,
@@ -35,6 +36,7 @@ EXPECTED_PRIMARY_KEYS = {
     "product": ("product_id", "shop_id"),
     "product_sku": ("sku", "shop_id"),
     "action_log": ("id",),
+    "collection_run": ("id",),
 }
 
 EXPECTED_INDEXES = {
@@ -42,6 +44,7 @@ EXPECTED_INDEXES = {
     "stock_daily_by_shop_day",
     "product_sku_by_product",
     "action_log_by_shop_time",
+    "collection_run_by_day",
 }
 
 AD_ROW = (
@@ -182,7 +185,7 @@ async def test_broken_migration_raises_and_rolls_back_whole(tmp_path, monkeypatc
         [
             *series.MIGRATIONS,
             (
-                2,
+                series.SCHEMA_VERSION + 1,
                 (
                     "CREATE TABLE half_applied (x INTEGER)",
                     "CREATE TABLE ВОТ ЗДЕСЬ СЛОМАНО (",
@@ -201,7 +204,7 @@ async def test_broken_migration_raises_and_rolls_back_whole(tmp_path, monkeypatc
     monkeypatch.undo()
     conn = await series.open_db(tmp_path, busy_timeout_s=1.0)
     try:
-        assert await _version(conn) == 1, "версия сдвинулась несмотря на отказ"
+        assert await _version(conn) == series.SCHEMA_VERSION, "версия сдвинулась несмотря на отказ"
         assert "half_applied" not in await _tables(conn), "откат не снял начатое"
     finally:
         await conn.close()
@@ -220,7 +223,8 @@ async def test_locked_database_is_reported_not_swallowed(tmp_path, monkeypatch):
     monkeypatch.setattr(
         series,
         "MIGRATIONS",
-        [*series.MIGRATIONS, (2, ("CREATE TABLE later (x INTEGER)",))],
+        [*series.MIGRATIONS,
+         (series.SCHEMA_VERSION + 1, ("CREATE TABLE later (x INTEGER) STRICT",))],
     )
 
     blocker = sqlite3.connect(tmp_path / series.DB_NAME, isolation_level=None, timeout=1)
@@ -235,7 +239,7 @@ async def test_locked_database_is_reported_not_swallowed(tmp_path, monkeypatch):
     monkeypatch.undo()
     conn = await series.open_db(tmp_path)
     try:
-        assert await _version(conn) == 1
+        assert await _version(conn) == series.SCHEMA_VERSION
     finally:
         await conn.close()
 
@@ -345,8 +349,8 @@ async def test_duplicate_migration_version_is_refused(tmp_path, monkeypatch):
         "MIGRATIONS",
         [
             *series.MIGRATIONS,
-            (2, ("CREATE TABLE from_branch_a (x INTEGER) STRICT",)),
-            (2, ("CREATE TABLE from_branch_b (x INTEGER) STRICT",)),
+            (series.SCHEMA_VERSION + 1, ("CREATE TABLE from_branch_a (x INTEGER) STRICT",)),
+            (series.SCHEMA_VERSION + 1, ("CREATE TABLE from_branch_b (x INTEGER) STRICT",)),
         ],
     )
     with pytest.raises(series.SeriesSchemaError, match="не применится никогда"):
@@ -365,7 +369,8 @@ async def test_gap_in_migration_numbers_is_refused(tmp_path, monkeypatch):
     monkeypatch.setattr(
         series,
         "MIGRATIONS",
-        [*series.MIGRATIONS, (3, ("CREATE TABLE skipped_two (x INTEGER) STRICT",))],
+        [*series.MIGRATIONS,
+         (series.SCHEMA_VERSION + 2, ("CREATE TABLE skipped_one (x INTEGER) STRICT",))],
     )
     with pytest.raises(series.SeriesSchemaError, match="подряд"):
         await series.open_db(tmp_path)

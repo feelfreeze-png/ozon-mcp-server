@@ -84,6 +84,12 @@ def get_seller_for_shop(shop_id: str) -> OzonSellerClient:
     return _get_seller(shop_id)
 
 
+def get_perf_for_shop(shop_id: str) -> OzonPerformanceClient:
+    """Клиент рекламы для сборщика. Тот же пул, что у MCP-пути: токен живёт 30 минут,
+    и заводить второй клиент на тот же магазин значит дважды его перевыпускать."""
+    return _get_perf(shop_id)
+
+
 async def reset_shop(shop_id: str):
     """Закрыть и удалить клиентов конкретного магазина."""
     if shop_id in _pool:

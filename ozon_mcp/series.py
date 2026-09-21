@@ -179,6 +179,26 @@ _M1_ACTION_LOG = """
     ) STRICT
 """
 
+_M2_COLLECTION_RUN = """
+    CREATE TABLE collection_run (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        day_msk      TEXT    NOT NULL,
+        shop_id      TEXT    NOT NULL,
+        source       TEXT    NOT NULL,
+        started_at   TEXT    NOT NULL,
+        finished_at  TEXT,
+        status       TEXT    NOT NULL,          -- running | ok | failed
+        campaigns    INTEGER,
+        rows_written INTEGER,
+        error        TEXT,
+        CHECK (day_msk GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+        CHECK (status IN ('running', 'ok', 'failed')),
+        CHECK (started_at GLOB '*[+-][0-9][0-9]:[0-9][0-9]' OR started_at GLOB '*Z'),
+        CHECK (finished_at IS NULL
+               OR finished_at GLOB '*[+-][0-9][0-9]:[0-9][0-9]' OR finished_at GLOB '*Z')
+    ) STRICT
+"""
+
 MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
     (
         1,
@@ -192,6 +212,13 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
             "CREATE INDEX product_sku_by_product ON product_sku (product_id, shop_id)",
             _M1_ACTION_LOG,
             "CREATE INDEX action_log_by_shop_time ON action_log (shop_id, at)",
+        ),
+    ),
+    (
+        2,
+        (
+            _M2_COLLECTION_RUN,
+            "CREATE INDEX collection_run_by_day ON collection_run (shop_id, day_msk)",
         ),
     ),
 ]
@@ -426,6 +453,74 @@ async def close_db() -> None:
 def is_enabled() -> bool:
     """Открыто ли хранилище. Нужно, чтобы отличать «нечего показать» от «нечем смотреть»."""
     return _db is not None
+
+
+AD_DAILY_COLUMNS = (
+    "date_msk", "sku", "campaign_id", "shop_id",
+    "expense", "views", "clicks", "to_cart",
+    "orders", "model_orders", "sales", "model_sales", "price",
+    "source", "fetched_at",
+)
+
+_AD_DAILY_UPSERT = (
+    "INSERT OR REPLACE INTO ad_daily (" + ", ".join(AD_DAILY_COLUMNS) + ") "
+    "VALUES (" + ", ".join("?" * len(AD_DAILY_COLUMNS)) + ")"
+)
+
+
+async def upsert_ad_daily(db: aiosqlite.Connection, rows: list[dict]) -> int:
+    """Записать рекламный срез. Повторный прогон за тот же день ПЕРЕЗАПИСЫВАЕТ.
+
+    Ключ `(date_msk, sku, campaign_id, shop_id)` делает повтор безопасным: два прогона
+    подряд дают то же число строк, а не удвоенное. `INSERT OR REPLACE` выбран осознанно —
+    `INSERT OR IGNORE` оставил бы первую, то есть более старую, версию дня, и пересчёт
+    цифр Ozon задним числом до нас бы не дошёл.
+    """
+    payload = [tuple(row.get(column) for column in AD_DAILY_COLUMNS) for row in rows]
+    if not payload:
+        return 0
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        await db.executemany(_AD_DAILY_UPSERT, payload)
+        await db.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            await db.execute("ROLLBACK")
+        raise
+    return len(payload)
+
+
+async def start_run(db: aiosqlite.Connection, *, day_msk: str, shop_id: str,
+                    source: str, started_at: str) -> int:
+    """Отметить начало сбора и вернуть его идентификатор.
+
+    🔴 Ради этой таблицы она и заведена: без неё «строк за день нет» означает сразу две
+    разные вещи — расхода не было и сбор не отработал. Отличить их по самому ряду
+    невозможно, а цена разная: первое нормально, второе — потерянные навсегда сутки.
+
+    Прогон, оборвавшийся на полпути, остаётся в состоянии `running` навсегда. Это не
+    недосмотр: незавершённый сбор обязан быть видимым, а не выглядеть как отсутствие.
+    """
+    cursor = await db.execute(
+        "INSERT INTO collection_run (day_msk, shop_id, source, started_at, status) "
+        "VALUES (?, ?, ?, ?, 'running')",
+        (day_msk, shop_id, source, started_at),
+    )
+    return int(cursor.lastrowid)
+
+
+async def finish_run(db: aiosqlite.Connection, run_id: int, *, status: str,
+                     finished_at: str, campaigns: int | None = None,
+                     rows_written: int | None = None, error: str | None = None) -> None:
+    """Закрыть прогон. `status` — только `ok` или `failed`, третьего исхода нет."""
+    if status not in ("ok", "failed"):
+        raise ValueError(f"статус прогона {status!r}: ожидалось 'ok' или 'failed'")
+    await db.execute(
+        "UPDATE collection_run SET status = ?, finished_at = ?, campaigns = ?, "
+        "rows_written = ?, error = ? WHERE id = ?",
+        (status, finished_at, campaigns, rows_written, error, run_id),
+    )
+    await db.commit()
 
 
 def connection() -> aiosqlite.Connection:

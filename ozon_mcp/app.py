@@ -1,6 +1,7 @@
 """FastAPI-приложение: MCP через SSE + веб-интерфейс (мульти-магазин) + диагностика."""
 
 import os
+from datetime import timedelta as _timedelta
 import asyncio
 import secrets
 import uvicorn
@@ -15,8 +16,11 @@ from starlette.types import Receive, Scope, Send
 
 from mcp.server.sse import SseServerTransport
 
-from ozon_mcp.server import get_mcp_app, reset_all_clients, reset_shop, set_stats_callback, get_seller_for_shop
-from ozon_mcp import settings as cfg
+from ozon_mcp.server import (
+    get_mcp_app, reset_all_clients, reset_shop, set_stats_callback,
+    get_seller_for_shop, get_perf_for_shop,
+)
+from ozon_mcp import collector, series, settings as cfg, timezones
 from ozon_mcp import stats
 from ozon_mcp import diagnostics as diag
 from ozon_mcp import tenancy
@@ -80,6 +84,63 @@ async def _health_loop():
         await asyncio.sleep(HEALTH_CHECK_INTERVAL_MIN * 60)
 
 
+#: Во сколько по МСК снимать вчерашний день. С запасом после полуночи: Ozon
+#: доводит цифры закрытых суток не мгновенно, а ошибиться здесь дорого — окно
+#: `products/sku` закрывается через сутки, и пропущенный день невосстановим.
+COLLECT_AT_MSK_HOUR = int(os.environ.get("COLLECT_AT_MSK_HOUR", "3"))
+COLLECT_ENABLED = os.environ.get("COLLECT_ENABLED", "1") not in ("0", "", "false", "no")
+
+_collect_task: asyncio.Task | None = None
+_series_error: str | None = None
+
+
+def _seconds_until_next_run() -> float:
+    """Сколько спать до ближайшего часа сбора по МСК."""
+    now = timezones.now_msk()
+    target = now.replace(hour=COLLECT_AT_MSK_HOUR, minute=0, second=0, microsecond=0)
+    if target <= now:
+        target += _timedelta(days=1)
+    return (target - now).total_seconds()
+
+
+async def _collect_once() -> None:
+    """Один проход сбора по всем магазинам.
+
+    ⚠️ Ошибки НЕ проглатываются, в отличие от соседнего `_health_loop`: пропущенные
+    сутки рекламной статистики не восстанавливаются ничем, поэтому отказ обязан
+    попасть и в журнал прогонов, и в лог контейнера.
+    """
+    if not series.is_enabled():
+        print(f"СБОР НЕ ИДЁТ: хранилище ряда недоступно ({_series_error}). "
+              "Сутки рекламной статистики теряются безвозвратно.", flush=True)
+        return
+    db = series.connection()
+    day = timezones.yesterday_msk()
+    for shop in cfg.get_shop_list(DATA_DIR):
+        shop_id = shop["id"]
+        try:
+            perf = get_perf_for_shop(shop_id)
+            result = await collector.collect_day(perf, db, shop_id=shop_id, day=day)
+            print(f"сбор {shop_id} за {day}: строк {result.rows_written}, "
+                  f"SKU {result.distinct_sku}, кампаний {result.campaigns}, "
+                  f"расход {result.expense_total}", flush=True)
+            if result.unknown_fields:
+                print(f"  ⚠️ Ozon прислал незнакомые поля: "
+                      f"{sorted(result.unknown_fields)}", flush=True)
+        except Exception as exc:
+            # Гасим здесь только ради соседних магазинов: отказ уже записан в
+            # collection_run как failed и напечатан. Молчаливого пропуска нет.
+            print(f"СБОР ПРОВАЛЕН {shop_id} за {day}: {type(exc).__name__}: {exc}",
+                  flush=True)
+
+
+async def _collect_loop() -> None:
+    """Раз в сутки по МСК, с запасом после полуночи."""
+    while True:
+        await asyncio.sleep(_seconds_until_next_run())
+        await _collect_once()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _health_task
@@ -91,13 +152,30 @@ async def lifespan(app: FastAPI):
               "Допустимо только на localhost в закрытом контуре.", flush=True)
     await stats.init_db(DATA_DIR)
     set_stats_callback(stats.record_call)
+    global _series_error
+    try:
+        await series.init_db(DATA_DIR)
+        _series_error = None
+    except Exception as exc:
+        # Громко и на старте. Сервер продолжает отвечать на чтение, но накопление
+        # ряда встало — а это единственное, что невосстановимо.
+        _series_error = f"{type(exc).__name__}: {exc}"
+        print(f"ВНИМАНИЕ: хранилище ряда не открылось ({_series_error}). "
+              "Ежедневный сбор рекламы НЕ ПОЙДЁТ, и пропущенные сутки не вернуть.",
+              flush=True)
+    global _collect_task
+    if COLLECT_ENABLED:
+        _collect_task = asyncio.create_task(_collect_loop())
     if HEALTH_CHECK_INTERVAL_MIN > 0:
         _health_task = asyncio.create_task(_health_loop())
     yield
     if _health_task:
         _health_task.cancel()
+    if _collect_task:
+        _collect_task.cancel()
     await reset_all_clients()
     await stats.close_db()
+    await series.close_db()
 
 
 fastapi_app = FastAPI(lifespan=lifespan)
