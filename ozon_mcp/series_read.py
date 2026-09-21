@@ -217,3 +217,48 @@ async def stock_series(
     if truncated:
         answer.update({"_truncated": True, "_shown": len(rows), "_limit": capped})
     return answer
+
+
+async def ad_rows_for_report(
+    db: aiosqlite.Connection, *, shop_id: str, date_from: str, date_to: str,
+) -> list[dict[str, Any]]:
+    """Строки ряда в разрезе `sku × кампания` — вход сборщика отчёта.
+
+    Разрез именно такой, потому что правило ДРР различает кампании по виду расхода:
+    агрегировав до товара заранее, мы потеряли бы возможность выделить тариф.
+    """
+    window = _check(shop_id, date_from, date_to, "sku")
+    async with db.execute(
+        "SELECT sku, campaign_id, sum(expense) AS expense, sum(orders) AS orders, "
+        "sum(model_orders) AS model_orders, sum(sales) AS sales "
+        "FROM ad_daily WHERE shop_id = ? AND date_msk BETWEEN ? AND ? "
+        "GROUP BY sku, campaign_id",
+        (shop_id, window[0], window[-1]),
+    ) as cur:
+        return [dict(zip(("sku", "campaign_id", "expense", "orders",
+                          "model_orders", "sales"), row))
+                for row in await cur.fetchall()]
+
+
+async def stock_on_day(
+    db: aiosqlite.Connection, *, shop_id: str, day: str, source: str = "snapshot",
+) -> dict[int, int] | None:
+    """Остаток по товарам на день. `None` — снимка за этот день НЕТ.
+
+    🔴 Разница между `None` и пустым словарём несущая: первое значит «не проверяли»,
+    второе — «проверили, остатка нет нигде». Аномалия «заказы без остатка» на первом
+    обязана молчать, а не обвинять.
+    """
+    timezones.require_plain_day(day, "day")
+    async with db.execute(
+        "SELECT count(*) FROM stock_daily WHERE shop_id = ? AND date_msk = ? AND source = ?",
+        (shop_id, day, source),
+    ) as cur:
+        if (await cur.fetchone())[0] == 0:
+            return None
+    async with db.execute(
+        "SELECT sku, sum(qty) FROM stock_daily "
+        "WHERE shop_id = ? AND date_msk = ? AND source = ? GROUP BY sku",
+        (shop_id, day, source),
+    ) as cur:
+        return {int(sku): int(qty or 0) for sku, qty in await cur.fetchall()}

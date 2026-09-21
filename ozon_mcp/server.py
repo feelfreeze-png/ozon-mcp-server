@@ -35,7 +35,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from ozon_mcp import (
-    failures, readonly, series, series_read, shaping, tenancy, toolsets,
+    failures, readonly, report, series, series_read, shaping, tenancy, toolsets,
 )
 from ozon_mcp.client import (
     OzonSellerClient, OzonPerformanceClient, normalize_sku_rows,
@@ -529,6 +529,20 @@ TOOLS = [
            "skus": NUMERIC_ID_ARRAY,
            "source": {"type": "string", "description": "snapshot | placement_report"},
            "limit": {"type": "integer"}},
+          ["date_from", "date_to"]),
+    _tool("ozon_ad_report",
+          "[P0] DAILY AD REPORT from the accumulated series: ДРР per SKU, share of ad "
+          "orders in total orders, anomalies (spend without orders, orders without "
+          "stock, gaps in the series). ДРР counts MANAGED spend only — CPC plus CPO on "
+          "selected products; the 'pay per order: ALL products' tariff is excluded and "
+          "shown on its own line. The rule lives in code, not in the prompt. "
+          "Needs one live call for campaign kinds; without it ДРР is NOT computed and "
+          "the report says so (ежедневный отчёт по рекламе из накопленного ряда).",
+          {"date_from": {"type": "string", "description": "YYYY-MM-DD, МСК"},
+           "date_to": {"type": "string", "description": "YYYY-MM-DD, МСК"},
+           "top": {"type": "integer", "description": "сколько товаров показать, по умолчанию 20"},
+           "with_total_orders": {"type": "boolean",
+                                 "description": "дочитать общие заказы из аналитики Ozon"}},
           ["date_from", "date_to"]),
     _tool("ozon_ad_balance",
           "Ad account balance; no official method, see spend in ozon_ad_statistics_expenses (баланс рекламы)."),
@@ -1332,6 +1346,51 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
     if name == "ozon_search_promo_bids":
         p = _get_perf(shop_id)
         return _json(await p.search_promo_cpo_bids(arguments["skus"]))
+    if name == "ozon_ad_report":
+        if not series.is_enabled():
+            raise failures.OzonBusinessError(
+                "хранилище ряда не открыто: отчёт собирать не из чего",
+                endpoint="series.db")
+        db = series.connection()
+        day_from, day_to = arguments["date_from"], arguments["date_to"]
+        raw = await series_read.ad_series(
+            db, shop_id=shop_id, date_from=day_from, date_to=day_to,
+            group_by="sku", limit=series_read.MAX_ROWS)
+        rows = await series_read.ad_rows_for_report(
+            db, shop_id=shop_id, date_from=day_from, date_to=day_to)
+
+        # Классификация кампаний — единственный живой вызов отчёта. Не получилось —
+        # ДРР не считается и отчёт об этом говорит.
+        kinds = None
+        kinds_error = None
+        try:
+            perf = _get_perf(shop_id)
+            listing = await perf.campaigns_all(page_size=100)
+            kinds = report.campaign_kinds(listing["list"])
+        except Exception as exc:
+            # Гасим намеренно и ГРОМКО: без классификации отчёт собирается, но без
+            # ДРР — и причина уезжает в сам отчёт. Молчаливое `pass` здесь дало бы
+            # отчёт без ДРР без единого слова о том, почему.
+            kinds_error = f"{type(exc).__name__}: {exc}"
+
+        stock = await series_read.stock_on_day(db, shop_id=shop_id, day=day_to)
+        total_orders = None
+        if arguments.get("with_total_orders"):
+            from ozon_mcp import analytics
+            seller = _get_seller(shop_id)
+            total_orders = await analytics.orders_by_sku_day(
+                seller, date_from=day_from, date_to=day_to)
+
+        built = report.build(
+            period=raw["период"], coverage=raw["coverage"], ad_rows=rows,
+            kinds=kinds, total_orders=total_orders, stock=stock,
+            top=int(arguments.get("top") or 20))
+        if kinds_error:
+            built.notes.append(
+                f"Классификацию кампаний получить не удалось ({kinds_error}). "
+                "Поэтому ДРР не посчитан — это отказ, а не отсутствие расхода.")
+        return _json(built.as_dict())
+
     if name in ("ozon_ad_series", "ozon_stock_series"):
         # Читаем СВОЁ хранилище, а не Ozon: ключей для этого не нужно, зато нужен
         # магазин — таблицы общие, разделение колонкой.
