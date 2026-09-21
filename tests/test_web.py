@@ -76,3 +76,90 @@ def test_stats_api(client):
 def test_stats_api_with_shop_filter(client):
     r = client.get("/api/stats?shop=test")
     assert r.status_code == 200
+
+
+# ── Сборщик: его состояние спрашивается, а не выводится из молчания ──────────
+
+
+def test_health_reports_that_collection_is_alive(client):
+    """🔴 Зелёный сервис и растущий ряд — разные утверждения.
+
+    `asyncio.Task` сборщика, упавшая с исключением, умирает молча: сервер отвечает
+    как обычно, healthcheck контейнера зелёный, а ряд просто перестаёт расти. До этой
+    правки узнать об этом было неоткуда, кроме блока покрытия в отчёте — то есть
+    через сутки в лучшем случае.
+    """
+    body = client.get("/api/health").json()
+    assert body["collect_enabled"] is True
+    assert body["collect_alive"] is True, "задача сбора не запущена"
+    assert body["collect_stopped_reason"] is None
+    assert body["collect_next_at_msk"], "время ближайшего сбора не названо"
+
+
+def test_health_says_when_the_next_collection_is(client):
+    """Время ближайшего прохода — по Москве и с поясом, как весь ряд."""
+    at = client.get("/api/health").json()["collect_next_at_msk"]
+    assert at.endswith("+03:00"), f"метка без московского пояса: {at}"
+
+
+def test_a_dead_collector_is_visible_in_health(client):
+    """Ради этого случая поле и заведено: сервис жив, а ряд не растёт."""
+    import ozon_mcp.app as app_module
+
+    app_module._collect_task.cancel()
+    app_module._collect_stopped = "RuntimeError: ряд не открылся"
+
+    body = client.get("/api/health").json()
+    assert body["collect_alive"] is False
+    assert "RuntimeError" in body["collect_stopped_reason"]
+    assert body["status"] == "ok", "живость сервиса и живость сбора — разные вещи"
+
+
+@pytest.mark.asyncio
+async def test_the_loop_survives_a_failed_day(monkeypatch):
+    """Потерять сутки из-за отказа плохо; потерять из-за них ВСЕ последующие — хуже."""
+    import asyncio
+
+    import ozon_mcp.app as app_module
+
+    calls = []
+
+    async def failing_once():
+        calls.append(len(calls))
+        if len(calls) == 1:
+            raise RuntimeError("Ozon недоступен")
+
+    async def _no_wait(_seconds):
+        if len(calls) >= 2:
+            raise asyncio.CancelledError
+        return None
+
+    monkeypatch.setattr(app_module, "_collect_once", failing_once)
+    monkeypatch.setattr(app_module.asyncio, "sleep", _no_wait)
+
+    with pytest.raises(asyncio.CancelledError):
+        await app_module._collect_loop()
+
+    assert len(calls) == 2, "цикл не пережил неудачный день"
+    assert app_module._collect_stopped is None, "успех обязан снимать прежнюю причину"
+
+
+@pytest.mark.asyncio
+async def test_a_failed_day_is_printed_loudly(monkeypatch, capsys):
+    import asyncio
+
+    import ozon_mcp.app as app_module
+
+    async def failing_once():
+        raise RuntimeError("Ozon недоступен")
+
+    async def _no_wait(_seconds):
+        if "СБОР УПАЛ ЦЕЛИКОМ" in capsys.readouterr().out:
+            raise asyncio.CancelledError
+        return None
+
+    monkeypatch.setattr(app_module, "_collect_once", failing_once)
+    monkeypatch.setattr(app_module.asyncio, "sleep", _no_wait)
+    with pytest.raises(asyncio.CancelledError):
+        await app_module._collect_loop()
+    assert app_module._collect_stopped.startswith("RuntimeError")

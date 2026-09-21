@@ -163,11 +163,64 @@ async def _collect_once() -> None:
                   flush=True)
 
 
+#: Когда ближайший сбор — чтобы это можно было спросить снаружи, а не выводить из
+#: отсутствия жалоб. Заполняется циклом перед каждым засыпанием.
+_next_collect_at: str | None = None
+
+#: Почему цикл сбора остановился. `None` — значит работает. Непустое значение
+#: переживает смерть задачи и отвечает на вопрос «почему ряд перестал расти».
+_collect_stopped: str | None = None
+
+
 async def _collect_loop() -> None:
-    """Раз в сутки по МСК, с запасом после полуночи."""
+    """Раз в сутки по МСК, с запасом после полуночи.
+
+    🔴 **Цикл обязан пережить неудачный день.** `asyncio.Task`, упавшая с исключением,
+    умирает молча: сервер продолжает отвечать, healthcheck зелёный, а ряд просто
+    перестаёт расти — и узнать об этом можно будет только по блоку покрытия в отчёте,
+    через сутки или через неделю. Поэтому исключение здесь печатается громко, и цикл
+    идёт дальше: пропущенные сутки рекламной статистики не восстанавливаются ничем,
+    и терять из-за одного отказа ещё и все последующие — худший обмен из возможных.
+
+    `CancelledError` наружу пропускается: это штатная остановка при выключении.
+    """
+    global _next_collect_at, _collect_stopped
     while True:
-        await asyncio.sleep(_seconds_until_next_run())
-        await _collect_once()
+        delay = _seconds_until_next_run()
+        _next_collect_at = (timezones.now_msk() + _timedelta(seconds=delay)).isoformat()
+        print(f"сбор: следующий проход {_next_collect_at} "
+              f"(через {delay / 3600:.1f} ч)", flush=True)
+        await asyncio.sleep(delay)
+        try:
+            await _collect_once()
+        except asyncio.CancelledError:
+            _collect_stopped = "остановлен штатно"
+            raise
+        except BaseException as exc:
+            _collect_stopped = f"{type(exc).__name__}: {exc}"
+            print(f"СБОР УПАЛ ЦЕЛИКОМ: {_collect_stopped}. Цикл продолжает работу, "
+                  f"следующая попытка завтра — но сегодняшние сутки потеряны и не "
+                  f"восстановятся.", flush=True)
+        else:
+            _collect_stopped = None
+
+
+def _watch_collect_task(task: asyncio.Task) -> None:
+    """Последний рубеж: сказать вслух, если задача сбора вообще завершилась.
+
+    До этого её никто не ждал, а значит её смерть была неотличима от работы.
+    """
+    global _collect_stopped
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        _collect_stopped = f"{type(exc).__name__}: {exc}"
+        print(f"ЗАДАЧА СБОРА ПОГИБЛА: {_collect_stopped}. Ряд больше НЕ пополняется "
+              f"до перезапуска сервера.", flush=True)
+    else:
+        _collect_stopped = "задача завершилась без ошибки — такого быть не должно"
+        print(f"ЗАДАЧА СБОРА ЗАВЕРШИЛАСЬ: {_collect_stopped}", flush=True)
 
 
 @asynccontextmanager
@@ -195,6 +248,11 @@ async def lifespan(app: FastAPI):
     global _collect_task
     if COLLECT_ENABLED:
         _collect_task = asyncio.create_task(_collect_loop())
+        _collect_task.add_done_callback(_watch_collect_task)
+    else:
+        # Выключенный сбор снаружи неотличим от работающего: сервер отвечает так же.
+        print("ВНИМАНИЕ: ежедневный сбор ВЫКЛЮЧЕН (COLLECT_ENABLED). Ряд не растёт.",
+              flush=True)
     if HEALTH_CHECK_INTERVAL_MIN > 0:
         _health_task = asyncio.create_task(_health_loop())
     yield
@@ -582,6 +640,14 @@ async def health(request: Request):
         "auth_enabled": bool(MCP_AUTH_TOKEN),
         "admin_auth_enabled": bool(ADMIN_TOKEN),
         "health_check_interval_min": HEALTH_CHECK_INTERVAL_MIN,
+        # Состояние сборщика спрашивается, а не выводится из отсутствия жалоб.
+        # `collect_alive: false` при зелёном `status` — ровно тот случай, ради
+        # которого поле и заведено: сервис жив, а ряд не растёт.
+        "collect_enabled": COLLECT_ENABLED,
+        "collect_alive": bool(_collect_task and not _collect_task.done()),
+        "collect_next_at_msk": _next_collect_at,
+        "collect_stopped_reason": _collect_stopped,
+        "series_error": _series_error,
         "recent_checks": history,
         "degraded_tools": degradations,
     })
