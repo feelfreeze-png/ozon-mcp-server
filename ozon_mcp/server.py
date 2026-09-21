@@ -503,7 +503,14 @@ TOOLS = [
 
     # === P1: АНАЛИТИКА ===
     _tool("ozon_analytics",
-          "Analytics by SKU. Funnel metrics (session_view, hits_view, position_category) are deprecated by Ozon; trade metrics work: revenue, ordered_units, delivered_units, returns, cancellations. For search positions use ozon_product_queries (аналитика).",
+          "Analytics by SKU/day. Measured 21.09.2026 — nine metrics return real values: "
+          "ordered_units, revenue, delivered_units, returns, cancellations, hits_view, "
+          "session_view, position_category, conv_tocart. The funnel three are NOT dead: "
+          "496204 hits and 233629 sessions over 14-20.09. "
+          "WARNING: an unknown metric name is dropped SILENTLY with HTTP 200, and values "
+          "arrive as a positional array — the rest shift left, so a number is read under "
+          "the wrong name. Use only names from this list "
+          "(аналитика по товарам и дням; неизвестная метрика выбрасывается молча).",
           {"date_from": {"type": "string"}, "date_to": {"type": "string"},
            "metrics": {"type": "array", "items": {"type": "string"}, "description": "revenue, ordered_units, delivered_units, returns, cancellations"},
            "dimensions": {"type": "array", "items": {"type": "string"}, "description": "sku, day, week, month"},
