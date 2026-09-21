@@ -62,8 +62,10 @@
 одну причину падать всем арендаторам сразу, ничего при этом не собирая.
 """
 
+import asyncio
 import contextlib
 import sqlite3
+import time
 from pathlib import Path
 
 import aiosqlite
@@ -206,10 +208,12 @@ def latest_version() -> int:
     versions = [version for version, _ in MIGRATIONS]
     if not versions:
         raise SeriesSchemaError("список миграций пуст — версия схемы неопределена")
-    if versions[0] != 1 or versions != sorted(set(versions)):
+    if versions != list(range(1, len(versions) + 1)):
         raise SeriesSchemaError(
-            f"версии миграций обязаны возрастать начиная с единицы, получено {versions}. "
-            "Повторный номер означает, что вторая миграция не применится никогда."
+            f"версии миграций обязаны идти подряд начиная с единицы, получено {versions}. "
+            "Повторный номер означает, что вторая миграция не применится никогда. "
+            "Пропуск номера — что миграция, доехавшая позже, не догонит установки, "
+            "которые уже ушли вперёд: они пропустят её по условию target <= version."
         )
     return versions[-1]
 
@@ -276,6 +280,17 @@ async def migrate(db: aiosqlite.Connection) -> int:
             # перечитывания второй упёрся бы в «table ad_daily already exists» —
             # громко, но на ровном месте.
             applied = await current_version(db)
+            if applied > target_version:
+                # Тот же гвард, что снаружи. Без него он обходится ровно той гонкой,
+                # ради которой написано перечитывание: сосед с более новым кодом мог
+                # закоммитить свою версию, пока мы ждали блокировку, — и мы бы приняли
+                # чужую схему молча, прочитав её уже после проверки.
+                await db.execute("ROLLBACK")
+                raise SeriesSchemaError(
+                    f"пока ждали блокировку, база {DB_NAME} ушла на версию {applied}, "
+                    f"а код знает только до {target_version}. Рядом работает более новая "
+                    "версия кода — со схемой, которой мы не знаем."
+                )
             if applied >= target:
                 await db.execute("ROLLBACK")
                 version = applied
@@ -297,7 +312,69 @@ async def migrate(db: aiosqlite.Connection) -> int:
             raise
         version = target
 
+    if version != target_version:
+        # Сюда можно прийти только если цикл отработал не так, как задумано: пропустил
+        # миграцию или остановился раньше. Возвращать в этом случае «какую-то» версию
+        # нельзя — вызывающий примет её за доведённую схему.
+        raise SeriesSchemaError(
+            f"после прогона версия схемы {version}, а ожидалась {target_version} — "
+            "миграция отработала не полностью."
+        )
     return version
+
+
+async def _try_enable_wal(db: aiosqlite.Connection) -> str | None:
+    """Одна попытка включить WAL. Возвращает режим журнала либо None, если база занята.
+
+    Занятость превращается в значение, а не в проглоченное исключение: решение «ждать
+    или сдаться» принимает вызывающий, и сдаётся он вслух. Всё, что не занятость,
+    поднимается дальше нетронутым.
+    """
+    try:
+        async with db.execute("PRAGMA journal_mode=WAL") as cur:
+            row = await cur.fetchone()
+    except sqlite3.OperationalError as exc:
+        if "locked" in str(exc) or "busy" in str(exc):
+            return None
+        raise
+    return (row[0] if row else "").lower()
+
+
+async def _enable_wal(db: aiosqlite.Connection, busy_timeout_s: float) -> None:
+    """Перевести базу в WAL, дождавшись занятости и сверив результат.
+
+    🔴 **Смена журнального режима не зовёт busy-handler.** Замерено (SQLite 3.50.4):
+    при соседе, держащем `BEGIN IMMEDIATE`, обычный `INSERT` честно ждёт весь таймаут
+    (5227 мс из 5000 заданных), а `PRAGMA journal_mode=WAL` отказывает через **0 мс**.
+    То есть `timeout=`, переданный в `connect`, не защищает первый же оператор, который
+    выполняет `open_db`. Сервер и сборщик, стартующие вместе на пустой базе, ловили на
+    этом отказ примерно в трети холодных стартов — и падали ДО того, как доходили до
+    механизма, который этот случай и должен покрывать.
+
+    Ждать обязан вызывающий, поэтому здесь цикл. Результат `PRAGMA` читается: SQLite на
+    отказ конверсии возвращает прежний режим строкой, а не ошибку, — молча остаться в
+    `delete` значило бы потерять и одновременный доступ, и целостность снимка бэкапа.
+    """
+    deadline = time.monotonic() + max(busy_timeout_s, 0.0)
+    delay = 0.01
+    mode = await _try_enable_wal(db)
+    while mode is None:
+        if time.monotonic() >= deadline:
+            raise SeriesSchemaError(
+                f"не удалось перевести {DB_NAME} в режим WAL за {busy_timeout_s} с: "
+                "база занята другим процессом. Смена журнального режима не ждёт "
+                "освобождения сама, поэтому ждём здесь — и сдаёмся вслух."
+            )
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 0.2)
+        mode = await _try_enable_wal(db)
+
+    if mode != "wal":
+        raise SeriesSchemaError(
+            f"{DB_NAME} осталась в режиме журнала '{mode}' вместо 'wal'. "
+            "Продолжать нельзя: в этом режиме писатель блокирует читателей, а снимок "
+            "бэкапа перестаёт быть согласованным."
+        )
 
 
 async def open_db(
@@ -319,7 +396,7 @@ async def open_db(
     try:
         db.row_factory = aiosqlite.Row
         # WAL: сборщик пишет, отчёты читают, и читатель не должен ждать писателя.
-        await db.execute("PRAGMA journal_mode=WAL")
+        await _enable_wal(db, busy_timeout_s)
         await migrate(db)
     except BaseException:
         await db.close()

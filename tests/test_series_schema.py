@@ -10,7 +10,12 @@
 """
 
 import ast
+import contextlib
 import sqlite3
+import subprocess
+import sys
+import textwrap
+import threading
 from pathlib import Path
 
 import aiosqlite
@@ -20,6 +25,24 @@ import pytest_asyncio
 from ozon_mcp import series
 
 TABLES = {"ad_daily", "stock_daily", "product", "product_sku", "action_log"}
+
+# Состав первичных ключей — не украшение, а основание приёмки C4 («повторный сбор
+# перезаписывает, а не задваивает»). Сужение ключа даёт неверные деньги: один SKU,
+# продвигаемый двумя кампаниями в один день, схлопнулся бы в одну строку.
+EXPECTED_PRIMARY_KEYS = {
+    "ad_daily": ("date_msk", "sku", "campaign_id", "shop_id"),
+    "stock_daily": ("date_msk", "sku", "warehouse", "shop_id"),
+    "product": ("product_id", "shop_id"),
+    "product_sku": ("sku", "shop_id"),
+    "action_log": ("id",),
+}
+
+EXPECTED_INDEXES = {
+    "ad_daily_by_shop_day",
+    "stock_daily_by_shop_day",
+    "product_sku_by_product",
+    "action_log_by_shop_time",
+}
 
 AD_ROW = (
     "2026-09-19", 123456, 777, "shop1",
@@ -95,26 +118,52 @@ async def test_second_run_changes_nothing_and_keeps_data(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_migrate_on_a_current_database_executes_nothing(db, monkeypatch):
-    """Идемпотентность не «повторный CREATE прошёл», а «ни одного оператора».
+async def test_migrate_on_a_current_database_changes_nothing(db):
+    """Идемпотентность меряется по БАЗЕ, а не по вызовам.
 
-    Проверяется подменой `execute`: миграция на доведённой базе обязана только прочитать
-    версию. Без этого теста в миграции можно было бы держать `CREATE TABLE IF NOT EXISTS`
-    и считать повторный прогон идемпотентным, хотя он молча чинил бы расхождение схемы.
+    ⚠️ Первая редакция подменяла `db.execute` шпионом и смотрела на первое слово запроса.
+    Мимо шпиона шли `executemany`, `executescript` и `cursor().execute`, а фильтр по
+    словам BEGIN/CREATE/INSERT не видел DELETE, DROP, UPDATE и ALTER: ротация ряда,
+    заехавшая в конец миграции, прошла бы приёмку зелёной. Здесь спрашивается сама
+    база — `schema_version` (внутренний счётчик SQLite, растёт от любого DDL) и
+    `total_changes()` (число изменённых строк за соединение). Мимо них не пройдёт
+    ни один путь выполнения, каким бы методом оператор ни был отправлен.
     """
-    executed = []
-    original = db.execute
 
-    def spy(sql, *args, **kwargs):
-        executed.append(" ".join(str(sql).split()))
-        return original(sql, *args, **kwargs)
+    # Строки нужны РАЗНОГО возраста: ротация, заехавшая в миграцию, почти наверняка
+    # придёт с условием по дате. Пустая таблица её не поймает — удаление ничего не
+    # удалит, и `total_changes()` не шелохнётся.
+    await db.execute(AD_INSERT, AD_ROW)
+    await db.execute(AD_INSERT, ("2020-01-01", *AD_ROW[1:]))
 
-    monkeypatch.setattr(db, "execute", spy)
-    assert await series.migrate(db) == series.SCHEMA_VERSION
+    async def probe():
+        async with db.execute("PRAGMA schema_version") as cur:
+            cookie = (await cur.fetchone())[0]
+        async with db.execute("SELECT total_changes()") as cur:
+            changes = (await cur.fetchone())[0]
+        async with db.execute("SELECT count(*), min(date_msk) FROM ad_daily") as cur:
+            rows = await cur.fetchone()
+        return cookie, changes, tuple(rows)
 
-    assert not [sql for sql in executed if sql.upper().startswith(("BEGIN", "CREATE", "INSERT"))], (
-        f"миграция на доведённой базе что-то выполнила: {executed}"
-    )
+    before = await probe()
+
+    # Трассировка соединения видит ВСЕ пути: execute, executemany, executescript и
+    # cursor().execute. Она дополняет измерение эффекта: оператор, ничего не меняющий
+    # сегодня, завтра получит другое условие — и станет ротацией.
+    traced: list[str] = []
+    await db.set_trace_callback(lambda sql: traced.append(" ".join(sql.split())))
+    try:
+        assert await series.migrate(db) == series.SCHEMA_VERSION
+    finally:
+        await db.set_trace_callback(None)
+    after = await probe()
+
+    assert after[0] == before[0], "миграция на доведённой базе изменила схему"
+    assert after[1] == before[1], "миграция на доведённой базе изменила данные"
+    assert after[2] == before[2], "миграция на доведённой базе тронула накопленный ряд"
+
+    writing = [sql for sql in traced if not sql.upper().startswith("SELECT")]
+    assert not writing, f"на доведённой базе миграция обязана только читать, а выполнила: {writing}"
 
 
 # ── отрицательные: отказ обязан быть громким ─────────────────────────────────
@@ -253,14 +302,19 @@ def test_no_swallowing_branches_in_the_module():
     tree = ast.parse(Path(series.__file__).read_text(encoding="utf-8"))
 
     handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)]
-    swallowing = [h.lineno for h in handlers if not any(isinstance(x, ast.Raise) for x in ast.walk(h))]
-    assert not swallowing, f"в series.py обработчик без повторного броска, строки: {swallowing}"
-
-    reraising = [
-        (h.lineno, h.end_lineno)
-        for h in handlers
-        if any(isinstance(x, ast.Raise) for x in ast.walk(h))
+    # ⚠️ Вторая редакция искала `raise` ГДЕ УГОДНО в поддереве обработчика. Этого мало:
+    # `except Exception as exc: if "известный случай" in str(exc): raise` содержит raise,
+    # но глотает всё остальное — буквально форма stats.py, только «улучшенная».
+    # Требование строже: последний оператор ВЕРХНЕГО уровня тела обязан быть `raise`.
+    swallowing = [
+        h.lineno for h in handlers if not (h.body and isinstance(h.body[-1], ast.Raise))
     ]
+    assert not swallowing, (
+        "в series.py обработчик, не заканчивающийся повторным броском, "
+        f"строки: {swallowing}"
+    )
+
+    reraising = [(h.lineno, h.end_lineno) for h in handlers]
     stray = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.With):
@@ -297,6 +351,168 @@ async def test_duplicate_migration_version_is_refused(tmp_path, monkeypatch):
     )
     with pytest.raises(series.SeriesSchemaError, match="не применится никогда"):
         await series.open_db(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_gap_in_migration_numbers_is_refused(tmp_path, monkeypatch):
+    """Пропуск номера разводит установки так же тихо, как дубль.
+
+    Две ветки добавили миграции 2 и 3, выкатилась сначала третья. Установки уходят на
+    версию 3; доехавшая позже миграция 2 их уже не догонит — цикл пропустит её по
+    условию `target <= version`. Часть парка окажется со схемой, которой нет ни в одной
+    версии, и версия при этом у всех «правильная».
+    """
+    monkeypatch.setattr(
+        series,
+        "MIGRATIONS",
+        [*series.MIGRATIONS, (3, ("CREATE TABLE skipped_two (x INTEGER) STRICT",))],
+    )
+    with pytest.raises(series.SeriesSchemaError, match="подряд"):
+        await series.open_db(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_future_version_is_refused_inside_the_transaction_too(tmp_path, monkeypatch):
+    """Гвард «база новее кода» обязан стоять и на пути перечитывания версии.
+
+    Иначе он обходится ровно той гонкой, ради которой перечитывание и написано: пока мы
+    ждали блокировку, сосед с более новым кодом закоммитил свою версию. Снаружи мы
+    видели 0 и проверку прошли, а внутри читаем чужую схему — и приняли бы её молча.
+    """
+    ready = await series.open_db(tmp_path)
+    await ready.close()
+
+    real = series.current_version
+    seen = []
+
+    async def future_inside(db):
+        seen.append(1)
+        return 0 if len(seen) == 1 else 99
+
+    monkeypatch.setattr(series, "current_version", future_inside)
+
+    db = await aiosqlite.connect(tmp_path / series.DB_NAME, isolation_level=None)
+    try:
+        # ⚠️ Совпадение ищется по тексту ИМЕННО внутреннего гварда. Первая редакция
+        # искала «99» — и зеленела на снятом гварде, потому что то же число попадало
+        # в итоговую сверку версии после цикла. Тест ловил отказ, но не тот.
+        with pytest.raises(series.SeriesSchemaError, match="пока ждали блокировку"):
+            await series.migrate(db)
+        assert len(seen) >= 2
+        assert await real(db) == series.SCHEMA_VERSION, "база пострадала от отказа"
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_migrate_refuses_to_report_a_version_it_did_not_reach(tmp_path, monkeypatch):
+    """Итоговая сверка версии: вернуть «какую-то» версию хуже, чем не вернуть никакой.
+
+    Вызывающий примет возвращённое число за доведённую схему. Здесь объявленная цель
+    разведена с фактическим списком миграций — ровно то, что случится, если цикл
+    когда-нибудь пропустит шаг.
+    """
+    monkeypatch.setattr(series, "latest_version", lambda: 5)
+    with pytest.raises(series.SeriesSchemaError, match="отработала не полностью"):
+        await series.open_db(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_journal_mode_other_than_wal_is_refused(tmp_path, monkeypatch):
+    """SQLite на невозможность конверсии отвечает прежним режимом СТРОКОЙ, а не ошибкой.
+
+    Так бывает на файловых системах без разделяемой памяти — например на части сетевых
+    монтирований. Продолжить в режиме `delete` значило бы тихо потерять и одновременный
+    доступ, и согласованность снимка бэкапа: читатель начал бы блокировать писателя, а
+    ряд копился бы дальше как ни в чём не бывало.
+    """
+
+    async def pretend_delete(db):
+        return "delete"
+
+    monkeypatch.setattr(series, "_try_enable_wal", pretend_delete)
+    with pytest.raises(series.SeriesSchemaError, match="режиме журнала 'delete'"):
+        await series.open_db(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_wal_conversion_waits_for_a_busy_database(tmp_path):
+    """🔴 Смена журнального режима НЕ ждёт освобождения сама.
+
+    Замерено (SQLite 3.50.4): при соседе, держащем `BEGIN IMMEDIATE`, обычный `INSERT`
+    честно ждёт весь таймаут (5227 мс из 5000 заданных), а `PRAGMA journal_mode=WAL`
+    отказывает через 0 мс. То есть `timeout=`, переданный в `connect`, не защищает
+    первый же оператор `open_db` — и одновременный холодный старт сервера и сборщика
+    ронял примерно треть попыток ДО входа в механизм, который этот случай покрывает.
+
+    Здесь гонка сделана детерминированной: блокировка удерживается заведомо дольше
+    нуля и отпускается сама. Ждать обязан вызывающий — тест это и требует.
+    """
+    blocker = sqlite3.connect(
+        tmp_path / series.DB_NAME, isolation_level=None, check_same_thread=False
+    )
+    blocker.execute("CREATE TABLE held_by_neighbour (x INTEGER)")
+    blocker.execute("BEGIN IMMEDIATE")
+    release = threading.Timer(0.4, lambda: blocker.execute("ROLLBACK"))
+    release.start()
+    try:
+        conn = await series.open_db(tmp_path, busy_timeout_s=10.0)
+        try:
+            async with conn.execute("PRAGMA journal_mode") as cur:
+                assert (await cur.fetchone())[0].lower() == "wal"
+            assert await _version(conn) == series.SCHEMA_VERSION
+        finally:
+            await conn.close()
+    finally:
+        release.cancel()
+        with contextlib.suppress(sqlite3.Error):
+            blocker.execute("ROLLBACK")
+        blocker.close()
+
+
+@pytest.mark.asyncio
+async def test_many_processes_open_the_store_at_once(tmp_path):
+    """Настоящие процессы, а не корутины: единственное, ради чего стоит BEGIN IMMEDIATE.
+
+    Без этого теста подмена `BEGIN IMMEDIATE` на `BEGIN` проходит приёмку зелёной, а
+    одновременный старт ломается. Репозиторий уже несёт две точки входа (`ozon-mcp` и
+    `ozon-mcp-web`), обе работают с одним каталогом данных, так что два процесса на
+    `/data` — существующая топология, а не выдумка.
+    """
+    worker = textwrap.dedent(
+        """
+        import asyncio, pathlib, sys
+        from ozon_mcp import series
+
+        async def main():
+            db = await series.open_db(pathlib.Path(sys.argv[1]))
+            try:
+                async with db.execute("SELECT version FROM schema_version") as cur:
+                    print((await cur.fetchone())[0])
+            finally:
+                await db.close()
+
+        asyncio.run(main())
+        """
+    )
+    started = [
+        subprocess.Popen(
+            [sys.executable, "-c", worker, str(tmp_path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(6)
+    ]
+    results = [proc.communicate(timeout=120) for proc in started]
+
+    failed = [
+        (proc.returncode, err.strip()[-300:])
+        for proc, (_, err) in zip(started, results)
+        if proc.returncode != 0
+    ]
+    assert not failed, f"одновременный старт уронил процессы: {failed}"
+    assert {out.strip() for out, _ in results} == {str(series.SCHEMA_VERSION)}
 
 
 @pytest.mark.asyncio
@@ -447,6 +663,131 @@ async def test_repeat_of_the_same_day_collides_on_the_primary_key(db):
     await db.execute(STOCK_INSERT, STOCK_ROW)
     with pytest.raises(sqlite3.IntegrityError):
         await db.execute(STOCK_INSERT, STOCK_ROW)
+
+
+@pytest.mark.asyncio
+async def test_primary_keys_are_exactly_as_designed(db):
+    """Состав ключей сверяется с эталоном напрямую, а не косвенно через вставки.
+
+    ⚠️ Прежние тесты вставляли одну и ту же строку дважды — такой тест зелен при ЛЮБОМ
+    ключе, являющемся подмножеством своих колонок. Сужение ключа проходило приёмку.
+    """
+    for table, expected in EXPECTED_PRIMARY_KEYS.items():
+        async with db.execute(f"PRAGMA table_info({table})") as cur:
+            columns = await cur.fetchall()
+        actual = tuple(
+            name for _, name, _, _, _, pk in sorted(columns, key=lambda c: c[5]) if pk
+        )
+        assert actual == expected, f"ключ {table}: {actual}, ожидался {expected}"
+
+
+@pytest.mark.asyncio
+async def test_indexes_are_in_place(db):
+    """Индекс, потерянный при правке миграции, виден только на выросшем ряде."""
+    async with db.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name NOT LIKE 'sqlite_%'"
+    ) as cur:
+        actual = {row[0] for row in await cur.fetchall()}
+    assert actual == EXPECTED_INDEXES
+
+
+@pytest.mark.asyncio
+async def test_two_campaigns_on_one_sku_are_two_rows(db):
+    """Ключ различает кампании: иначе расход двух кампаний схлопнулся бы в одну строку."""
+    await db.execute(AD_INSERT, AD_ROW)
+    await db.execute(AD_INSERT, (*AD_ROW[:2], 888, *AD_ROW[3:]))
+    async with db.execute("SELECT count(*), sum(expense) FROM ad_daily") as cur:
+        rows, total = await cur.fetchone()
+    assert rows == 2 and total == pytest.approx(3.0)
+
+
+@pytest.mark.asyncio
+async def test_two_warehouses_on_one_sku_are_two_rows(db):
+    """То же для остатков: разрез по складу обязан сохраняться."""
+    await db.execute(STOCK_INSERT, STOCK_ROW)
+    await db.execute(STOCK_INSERT, (*STOCK_ROW[:2], "Софьино", *STOCK_ROW[3:]))
+    async with db.execute("SELECT count(*) FROM stock_daily") as cur:
+        assert (await cur.fetchone())[0] == 2
+
+
+@pytest.mark.asyncio
+async def test_product_table_holds_its_contract(db):
+    """Таблица товаров: раньше в неё не писал ни один тест — правилась бы зелёным."""
+    await db.execute(
+        "INSERT INTO product (product_id, shop_id, offer_id, name, archived, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (1001, "shop1", "ART-1", "Кружка", 0, "2026-09-20T03:15:00+03:00"),
+    )
+    with pytest.raises(sqlite3.IntegrityError):  # archived вне {0, 1}
+        await db.execute(
+            "INSERT INTO product (product_id, shop_id, archived, updated_at) VALUES (?, ?, ?, ?)",
+            (1002, "shop1", 2, "2026-09-20T03:15:00+03:00"),
+        )
+    with pytest.raises(sqlite3.IntegrityError):  # метка без пояса
+        await db.execute(
+            "INSERT INTO product (product_id, shop_id, updated_at) VALUES (?, ?, ?)",
+            (1003, "shop1", "2026-09-20T03:15:00"),
+        )
+    with pytest.raises(sqlite3.IntegrityError):  # тот же товар в том же магазине
+        await db.execute(
+            "INSERT INTO product (product_id, shop_id, updated_at) VALUES (?, ?, ?)",
+            (1001, "shop1", "2026-09-20T03:15:00+03:00"),
+        )
+
+
+@pytest.mark.asyncio
+async def test_product_sku_holds_its_contract(db):
+    """Один товар несёт несколько sku (sds и fbo) — это разные строки, не конфликт."""
+    for sku, src in ((201, "sds"), (202, "fbo"), (203, None)):
+        await db.execute(
+            "INSERT INTO product_sku (product_id, shop_id, sku, source) VALUES (?, ?, ?, ?)",
+            (1001, "shop1", sku, src),
+        )
+    async with db.execute("SELECT count(*) FROM product_sku") as cur:
+        assert (await cur.fetchone())[0] == 3
+
+    with pytest.raises(sqlite3.IntegrityError):  # источник вне перечня
+        await db.execute(
+            "INSERT INTO product_sku (product_id, shop_id, sku, source) VALUES (?, ?, ?, ?)",
+            (1001, "shop1", 204, "fbo2"),
+        )
+    with pytest.raises(sqlite3.IntegrityError):  # один sku дважды в одном магазине
+        await db.execute(
+            "INSERT INTO product_sku (product_id, shop_id, sku) VALUES (?, ?, ?)",
+            (1009, "shop1", 201),
+        )
+
+
+@pytest.mark.asyncio
+async def test_action_log_holds_its_contract(db):
+    """Журнал действий заводится сейчас, пишется на этапе 2 — и тогда уже поздно чинить.
+
+    Прежние значения задним числом не восстановить: если колонка `value_before`
+    потеряется при правке миграции, узнаем об этом в момент, когда она понадобится.
+    """
+    await db.execute(
+        "INSERT INTO action_log (at, shop_id, object_kind, object_id, field, "
+        "value_before, value_after, actor, result, error) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("2026-09-20T03:15:00+03:00", "shop1", "campaign", "777", "daily_budget",
+         "1000", "1500", "bot", "ok", None),
+    )
+    async with db.execute("SELECT id, value_before FROM action_log") as cur:
+        row_id, before = await cur.fetchone()
+    assert row_id == 1 and before == "1000"
+
+    with pytest.raises(sqlite3.IntegrityError):  # метка без пояса
+        await db.execute(
+            "INSERT INTO action_log (at, shop_id, object_kind, object_id, field, actor, result) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("2026-09-20T03:15:00", "shop1", "campaign", "777", "bid", "bot", "ok"),
+        )
+    with pytest.raises(sqlite3.IntegrityError):  # actor обязателен
+        await db.execute(
+            "INSERT INTO action_log (at, shop_id, object_kind, object_id, field, result) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("2026-09-20T03:15:00+03:00", "shop1", "campaign", "777", "bid", "ok"),
+        )
 
 
 @pytest.mark.asyncio
