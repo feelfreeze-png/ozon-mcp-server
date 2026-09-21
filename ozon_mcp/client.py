@@ -6,7 +6,7 @@ import re
 import httpx
 from datetime import datetime, timedelta, timezone
 
-from . import numbers, timezones
+from . import limits, numbers, timezones
 from typing import Any
 
 SELLER_BASE = "https://api-seller.ozon.ru"
@@ -1503,6 +1503,7 @@ class OzonPerformanceClient:
 
     async def bids_competitive(self, campaign_id: int, skus: list[int]) -> dict:
         """GET /api/client/campaign/{id}/products/bids/competitive — конкурентные ставки (≤200 SKU)."""
+        limits.check("competitive_bids.skus", skus)
         return await self._get(f"/api/client/campaign/{campaign_id}/products/bids/competitive",
                                {"skus": [str(s) for s in skus]})
 
@@ -1531,14 +1532,17 @@ class OzonPerformanceClient:
 
     async def search_promo_enable(self, skus: list[int]) -> dict:
         """POST /api/client/search_promo/product/enable — включить продвижение (≤1000 SKU)."""
+        limits.check("search_promo.skus", skus)
         return await self._post("/api/client/search_promo/product/enable", {"skus": [str(s) for s in skus]})
 
     async def search_promo_disable(self, skus: list[int]) -> dict:
         """POST /api/client/search_promo/product/disable — отключить продвижение (≤1000 SKU)."""
+        limits.check("search_promo.skus", skus)
         return await self._post("/api/client/search_promo/product/disable", {"skus": [str(s) for s in skus]})
 
     async def search_promo_cpo_bids(self, skus: list[int]) -> dict:
         """POST /api/client/search_promo/get_cpo_min_bids — фиксированные ставки CPO (≤200 SKU)."""
+        limits.check("cpo_min_bids.skus", skus)
         return await self._post("/api/client/search_promo/get_cpo_min_bids", {"skus": [str(s) for s in skus]})
 
     # ── Статистика ─────────────────────────────────────────
@@ -1563,6 +1567,7 @@ class OzonPerformanceClient:
             "groupBy": group_by,
         }
         timezones.check_statistics_period(body)
+        limits.check("statistics.campaigns", campaigns)
         async with self._report_slot:
             return await self._statistics_locked(body, _aio)
 
@@ -1653,6 +1658,7 @@ class OzonPerformanceClient:
         """
         if check_window:
             self.check_products_sku_window(date_from, date_to)
+        limits.check("products_sku.campaigns", campaigns)
         body = {
             "date_from": date_from,
             "date_to": date_to,
@@ -1660,6 +1666,31 @@ class OzonPerformanceClient:
         }
         timezones.check_statistics_period(body)
         return await self._post("/api/client/statistics/products/sku", body)
+
+    #: Пауза между порциями `products/sku`. Меньше, чем у списка кампаний: там замерен
+    #: жёсткий лимит, здесь 30 идентификаторов прошли за 0,20 с и потолок не нащупан.
+    PRODUCTS_SKU_CHUNK_PAUSE_S = 2.0
+
+    async def statistics_products_sku_all(
+        self, campaigns: list[int], day: str, *, pause_s: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Съём `products/sku` по всем кампаниям, порциями, с нормализацией строк.
+
+        Порция взята из `limits`, где у неё записано происхождение: 30 — не граница API,
+        а **проверенная безопасная порция** (потолок не нащупан). Разница важна: если
+        однажды придёт 429, искать надо не ошибку в коде, а настоящую границу.
+
+        Возвращает список строк. Пустой список означает «Ozon ответил, и строк нет», и
+        отличается от отказа тем, что отказ здесь бросается, а не превращается в пустоту.
+        """
+        pause = self.PRODUCTS_SKU_CHUNK_PAUSE_S if pause_s is None else pause_s
+        rows: list[dict[str, Any]] = []
+        for index, batch in enumerate(limits.chunks("products_sku.campaigns", campaigns)):
+            if index and pause:
+                await asyncio.sleep(pause)
+            raw = await self.statistics_products_sku(batch, day, day)
+            rows.extend(normalize_sku_rows(raw))
+        return rows
 
     async def statistics_products(self, campaigns: list[int], date_from: str, date_to: str) -> dict:
         """GET /api/client/statistics/campaign/product/json — статистика CPC-кампаний по товарам: расход, CTR, CPC, заказы, ДРР."""
