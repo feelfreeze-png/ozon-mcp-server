@@ -384,7 +384,12 @@ TOOLS = [
           "[P0] Ad campaigns: budgets in micro-rubles (1000000 = 1₽), statuses. adv_object_type: SKU | SEARCH_PROMO | BANNER. state: CAMPAIGN_STATE_RUNNING | _STOPPED | _INACTIVE (реклама, кампании).",
           {"campaign_ids": {**NUMERIC_ID_ARRAY, "description": "filter"},
            "adv_object_type": {"type": "string", "description": "type filter"},
-           "state": {"type": "string", "description": "status filter"}}),
+           "state": {"type": "string", "description": "status filter"},
+           "page": {"type": "integer", "description": "страница, с 1"},
+           "page_size": {"type": "integer", "description": "записей на странице, по умолчанию 100"},
+           "all_pages": {"type": "boolean",
+                         "description": "обойти ВСЕ страницы со сверкой по total; медленно "
+                                        "(пауза 9 с между страницами — список режется лимитом)"}}),
     _tool("ozon_ad_statistics",
           "[P0] Campaign statistics, async Ozon report, up to ~2 min. Limits: ≤10 campaigns, ≤62 days, one report at a time (статистика рекламы).",
           {"campaigns": {**NUMERIC_ID_ARRAY, "description": "campaign ids"},
@@ -1192,10 +1197,20 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
     # === РЕКЛАМА ===
     if name == "ozon_ad_campaigns":
         p = _get_perf(shop_id)
+        if arguments.get("all_pages"):
+            # Полный обход со сверкой по total: недобор роняет вызов, а не выдаёт
+            # кабинет меньшим, чем он есть.
+            return _json(await p.campaigns_all(
+                adv_object_type=arguments.get("adv_object_type"),
+                state=arguments.get("state"),
+                page_size=int(arguments.get("page_size") or 100),
+            ))
         return _json(await p.campaigns_list(
             campaign_ids=arguments.get("campaign_ids"),
             adv_object_type=arguments.get("adv_object_type"),
             state=arguments.get("state"),
+            page=int(arguments.get("page") or 1),
+            page_size=int(arguments.get("page_size") or 100),
         ))
     if name == "ozon_ad_statistics":
         p = _get_perf(shop_id)

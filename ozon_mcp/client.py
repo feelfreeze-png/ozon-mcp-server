@@ -1,6 +1,7 @@
 """HTTP-клиенты для Ozon Seller API и Performance API."""
 
 import asyncio
+import math
 import re
 import httpx
 from datetime import datetime, timedelta, timezone
@@ -1274,6 +1275,11 @@ class OzonPerformanceClient:
         self.client_secret = client_secret
         self._token: str | None = None
         self._token_at: float = 0.0
+        # Очередь асинхронных выгрузок: Ozon держит РОВНО ОДНУ активную на аккаунт и
+        # отвергает вторую мгновенно — `429 {"error":"Превышен лимит активных запросов
+        # (максимум 1)"}`. Без очереди второй вызов просто терял бы свой отчёт, а
+        # выглядело бы это как обычная ошибка сети.
+        self._report_slot = asyncio.Lock()
         self._http = httpx.AsyncClient(
             base_url=PERF_BASE,
             timeout=60.0,
@@ -1297,23 +1303,48 @@ class OzonPerformanceClient:
         self._token_at = _t.monotonic()
         self._http.headers["Authorization"] = f"Bearer {self._token}"
 
+    # ── Повторы ────────────────────────────────────────────
+    #
+    # У Seller-клиента ретраи есть с тех пор, как финансы переехали на начисления;
+    # у Performance их не было вовсе. Цена разная: один 429 здесь — это потерянный
+    # день рекламной статистики, а переснять его нечем (`products/sku` отдаёт только
+    # сегодня и вчера). Наверху отказ превращался в строку «Ошибка: …», то есть день
+    # пропадал тихо.
+    #
+    # ⚠️ Performance API **не отдаёт** ни `Retry-After`, ни `X-RateLimit-*` — замерено.
+    # Паузу выбираем сами, с запасом, и читаем `Retry-After` только если он вдруг есть.
+    _RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+    _RETRY_MAX = 3
+    _RETRY_CAP_S = 15.0
+
+    async def _send(self, method: str, path: str, *, params: dict | None = None,
+                    json_body: Any = None) -> dict:
+        delay = 1.0
+        last: httpx.Response | None = None
+        for attempt in range(self._RETRY_MAX + 1):
+            await self._ensure_token()
+            last = await self._http.request(method, path, params=params, json=json_body)
+            if last.status_code not in self._RETRY_STATUSES or attempt == self._RETRY_MAX:
+                break
+            header = last.headers.get("Retry-After", "")
+            try:
+                wait = float(header) if header else delay
+            except ValueError:
+                wait = delay
+            await asyncio.sleep(min(wait, self._RETRY_CAP_S))
+            delay = min(delay * 2, self._RETRY_CAP_S)
+        assert last is not None
+        last.raise_for_status()
+        return last.json() if last.content else {}
+
     async def _get(self, path: str, params: dict | None = None) -> dict:
-        await self._ensure_token()
-        r = await self._http.get(path, params=params)
-        r.raise_for_status()
-        return r.json()
+        return await self._send("GET", path, params=params)
 
     async def _post(self, path: str, body: dict | None = None) -> dict:
-        await self._ensure_token()
-        r = await self._http.post(path, json=body or {})
-        r.raise_for_status()
-        return r.json()
+        return await self._send("POST", path, json_body=body or {})
 
     async def _put(self, path: str, body: dict | None = None) -> dict:
-        await self._ensure_token()
-        r = await self._http.put(path, json=body or {})
-        r.raise_for_status()
-        return r.json()
+        return await self._send("PUT", path, json_body=body or {})
 
     # ── Кампании ───────────────────────────────────────────
     async def campaigns_list(self, campaign_ids: list[int] | None = None,
@@ -1333,6 +1364,69 @@ class OzonPerformanceClient:
             params["advObjectType"] = adv_object_type
         if state:
             params["state"] = state
+        return await self._campaigns_page(params)
+
+    #: Пауза между страницами обхода. Список кампаний режется лимитом жёстче
+    #: документированного: замерено, что второй запрос подряд даёт 429, а 9 секунд
+    #: между страницами проходят. Берём с запасом.
+    CAMPAIGNS_PAGE_PAUSE_S = 9.0
+
+    async def campaigns_all(
+        self, adv_object_type: str | None = None, state: str | None = None,
+        page_size: int = 100, pause_s: float | None = None,
+    ) -> dict:
+        """Полный обход списка кампаний со сверкой по `total`.
+
+        🔴 **Оборванный обход обязан быть виден.** Прежний код брал ровно первую
+        страницу из ста записей при 248 SKU-кампаниях в кабинете: половина кабинета
+        не существовала для агента, и ни один признак на это не указывал. Поэтому
+        здесь итог сверяется с `total` из самого ответа — оракул берётся у Ozon, а не
+        из константы, которая устареет на первой новой кампании.
+        """
+        pause = self.CAMPAIGNS_PAGE_PAUSE_S if pause_s is None else pause_s
+        collected: list[dict] = []
+        total: int | None = None
+        pages = 0
+        page = 1
+        while True:
+            params: dict[str, Any] = {"page": page, "pageSize": page_size}
+            if adv_object_type:
+                params["advObjectType"] = adv_object_type
+            if state:
+                params["state"] = state
+            payload = await self._campaigns_page(params)
+            pages += 1
+            chunk = payload.get("list") or []
+            collected.extend(chunk)
+            reported = numbers.parse_int(payload.get("total"), field="total")
+            if reported is not None:
+                total = reported
+            if total is None:
+                raise ValueError(
+                    "ответ списка кампаний не содержит total — сверить полноту обхода "
+                    "нечем, а недобор выглядит как маленький кабинет."
+                )
+            if len(collected) >= total or not chunk:
+                break
+            page += 1
+            if pause:
+                await asyncio.sleep(pause)
+
+        if len(collected) != total:
+            raise ValueError(
+                f"обход списка кампаний собрал {len(collected)} записей из {total} "
+                f"заявленных ({pages} страниц). Недобор молча выдал бы кабинет меньшим, "
+                "чем он есть."
+            )
+        expected_pages = math.ceil(total / page_size) if total else 1
+        if pages != expected_pages:
+            raise ValueError(
+                f"страниц пройдено {pages}, а по total={total} и pageSize={page_size} "
+                f"ожидалось {expected_pages}"
+            )
+        return {"list": collected, "total": total, "pages": pages, "pageSize": page_size}
+
+    async def _campaigns_page(self, params: dict[str, Any]) -> dict:
         return await self._get("/api/client/campaign", params)
 
     async def campaign_create(self, title: str, placement: str = "PLACEMENT_SEARCH_AND_CATEGORY",
@@ -1455,7 +1549,12 @@ class OzonPerformanceClient:
     ) -> Any:
         """Асинхронный отчёт: POST /api/client/statistics/json → poll → report.
 
-        Лимиты: ≤10 кампаний, период ≤62 дня, 1 одновременная выгрузка на аккаунт.
+        Лимиты: ≤10 кампаний, период ≤62 дня, **1 одновременная выгрузка на аккаунт**.
+
+        🔴 Второй одновременный вызов Ozon отвергает мгновенно — `429 {"error":
+        "Превышен лимит активных запросов (максимум 1)"}`, и его отчёт теряется.
+        Поэтому выгрузки выстраиваются в очередь здесь: ждать своей очереди дольше,
+        чем получить отказ, но отказ здесь означает потерянные данные.
         """
         import asyncio as _aio
         body = {
@@ -1464,6 +1563,11 @@ class OzonPerformanceClient:
             "groupBy": group_by,
         }
         timezones.check_statistics_period(body)
+        async with self._report_slot:
+            return await self._statistics_locked(body, _aio)
+
+    async def _statistics_locked(self, body: dict, _aio: Any) -> Any:
+        """Тело выгрузки, выполняемое под занятым слотом отчёта."""
         submit = await self._post("/api/client/statistics/json", body)
         uuid = submit.get("UUID")
         if not uuid:
