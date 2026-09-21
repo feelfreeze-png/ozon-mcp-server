@@ -22,6 +22,7 @@ v2.4.0 — профили инструментов (ozon_mcp/toolsets.py): OZON_
          токенов, pricing+ads = 5 425.
 """
 
+import contextlib
 import contextvars
 import json
 import os
@@ -35,7 +36,8 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from ozon_mcp import (
-    failures, readonly, report, series, series_read, shaping, tenancy, toolsets,
+    failures, readonly, report, series, series_read, shaping, tenancy,
+    timezones, toolsets,
 )
 from ozon_mcp.client import (
     OzonSellerClient, OzonPerformanceClient, normalize_sku_rows,
@@ -544,6 +546,14 @@ TOOLS = [
            "with_total_orders": {"type": "boolean",
                                  "description": "дочитать общие заказы из аналитики Ozon"}},
           ["date_from", "date_to"]),
+    _tool("ozon_seller_info",
+          "Cabinet profile: company, SUBSCRIPTION type and ratings. Measured 21.09.2026: "
+          "returns subscription.type (PREMIUM_PLUS here) — search analytics needs "
+          "Premium Plus or Pro, so this is the answer to 'what is available to us'. "
+          "Personal data (legal_name, inn, ogrn) is masked unless you pass "
+          "with_personal_data=true (профиль кабинета и тип подписки).",
+          {"with_personal_data": {"type": "boolean",
+                                  "description": "показать ФИО и ИНН; по умолчанию скрыты"}}),
     _tool("ozon_ad_balance",
           "Ad account balance; no official method, see spend in ozon_ad_statistics_expenses (баланс рекламы)."),
 
@@ -1091,6 +1101,27 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
     # клиента могла остаться от прошлой сессии, и вызов дойдёт сюда. Отказ должен
     # случиться ДО того, как запрос уйдёт в Ozon и спишет деньги.
     if readonly.is_blocked(name):
+        # Несостоявшееся действие тоже записывается. К воротам этапа 2 («владелец
+        # согласен с рекомендациями агента») именно эта запись отвечает на вопрос,
+        # что агент делал бы, будь ему позволено. Судить по памяти нечем.
+        if series.is_enabled():
+            try:
+                await series.record_action(
+                    series.connection(),
+                    at=timezones.now_msk_iso(),
+                    shop_id=str(arguments.get("shop_id") or ""),
+                    object_kind=readonly.object_kind(name),
+                    object_id=readonly.object_id(arguments),
+                    field=name, value_after=readonly.attempted_change(arguments),
+                    actor="assistant", result=series.ACTION_BLOCKED_READONLY)
+            except Exception as exc:
+                # Гасим ради самого отказа — он важнее журнала, — но ГРОМКО.
+                # ⚠️ Здесь стояло `contextlib.suppress(Exception)`, и оно проглотило
+                # NameError: `shop_id` — локальная переменная `call_tool`, а запись
+                # живёт в `_call_tool_impl`. Журнал молча не писался, а приёмка
+                # показывала пустую таблицу без единой причины.
+                print(f"ЖУРНАЛ ДЕЙСТВИЙ НЕ ЗАПИСАН ({name}): "
+                      f"{type(exc).__name__}: {exc}", flush=True)
         return [TextContent(type="text", text=readonly.refusal_message(name))]
 
     # Профиль проверяется следом: иначе выключенный инструмент упрётся в ошибку
@@ -1346,6 +1377,15 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
     if name == "ozon_search_promo_bids":
         p = _get_perf(shop_id)
         return _json(await p.search_promo_cpo_bids(arguments["skus"]))
+    if name == "ozon_seller_info":
+        seller = _get_seller(shop_id)
+        payload = await seller.seller_info()
+        # Персональные данные скрыты по умолчанию: ответ уходит в MCP-клиент, а оттуда
+        # в контекст модели и в её транскрипт. Раскрытие — осознанный аргумент.
+        if not arguments.get("with_personal_data"):
+            payload = failures.mask_seller_info(payload)
+        return _json(payload)
+
     if name == "ozon_ad_report":
         if not series.is_enabled():
             raise failures.OzonBusinessError(

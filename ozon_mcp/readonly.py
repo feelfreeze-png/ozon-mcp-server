@@ -142,3 +142,58 @@ def refusal_message(name: str) -> str:
         f"возвраты, сообщения покупателю. Чтение — статистика, ставки, остатки, "
         f"карточки, зоны размещения, отчёты — работает как обычно."
     )
+
+
+#: Из чего выводится вид объекта для журнала действий. Первое совпадение выигрывает.
+_OBJECT_KINDS: tuple[tuple[str, str], ...] = (
+    ("ozon_ad_campaign", "campaign"),
+    ("ozon_ad_products", "campaign_products"),
+    ("ozon_search_promo", "search_promo"),
+    ("ozon_product", "product"),
+    ("ozon_set_prices", "price"),
+    ("ozon_pricing", "pricing_strategy"),
+    ("ozon_min_price", "price"),
+    ("ozon_action", "action"),
+    ("ozon_seller_action", "seller_action"),
+    ("ozon_discount", "discount"),
+    ("ozon_order", "posting"),
+    ("ozon_cancellation", "cancellation"),
+    ("ozon_carriage", "carriage"),
+    ("ozon_returns", "return"),
+    ("ozon_chat", "chat"),
+    ("ozon_question", "question"),
+    ("ozon_review", "review"),
+)
+
+#: Имена аргументов, по которым опознаётся объект действия.
+_ID_ARGS = ("campaign_id", "product_id", "offer_id", "sku", "skus", "posting_number",
+            "strategy_id", "action_id", "review_id", "question_id", "chat_id")
+
+
+def object_kind(name: str) -> str:
+    for prefix, kind in _OBJECT_KINDS:
+        if name.startswith(prefix):
+            return kind
+    return "tool"
+
+
+def object_id(arguments: dict) -> str:
+    """Что именно пытались изменить. Пусто — значит не опознали, и так и написано."""
+    for key in _ID_ARGS:
+        value = arguments.get(key)
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, list):
+            head = ", ".join(str(item) for item in value[:5])
+            return f"{head}…" if len(value) > 5 else head
+        return str(value)
+    return ""
+
+
+def attempted_change(arguments: dict) -> str:
+    """Что было бы применено. Без `shop_id`: он подставляется нами, а не моделью."""
+    import json as _json
+
+    payload = {key: value for key, value in arguments.items()
+               if key not in ("shop_id", "view")}
+    return _json.dumps(payload, ensure_ascii=False, default=str)[:1000]

@@ -24,7 +24,9 @@ CORE = "core"
 
 # порядок важен: первое совпадение выигрывает
 RULES: tuple[tuple[str, str], ...] = (
-    (CORE,        r"^ozon_(list_shops|diagnostics|degradations|company|notification|notifications)"),
+    # `seller` — профиль кабинета и ТИП ПОДПИСКИ (F1): он отвечает на вопрос «что нам
+    # вообще доступно», а не относится ни к товарам, ни к рекламе.
+    (CORE,        r"^ozon_(list_shops|diagnostics|degradations|company|seller_info|notification|notifications)"),
     # `action` без `s`: под `actions` не попадало автодобавление в акции
     # (ozon_action_auto_add_*), и оно проваливалось в core — то есть ехало всегда.
     ("pricing",   r"^ozon_(get_prices|set_prices|min_price|pricing|action|seller_action|discount)"),

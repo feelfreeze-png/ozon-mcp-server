@@ -1224,6 +1224,23 @@ class OzonSellerClient:
         return await self._post("/v1/actions/discounts-task/decline", {"tasks": tasks})
 
     # ── Компания ───────────────────────────────────────────
+    async def seller_info(self) -> dict:
+        """POST /v1/seller/info — компания, ПОДПИСКА и рейтинги.
+
+        Замерено 21.09.2026: отвечает тремя блоками — `company` (название, форма
+        собственности, ИНН, система налогообложения), `subscription`
+        (`{"is_premium": bool, "type": "PREMIUM_PLUS"}`) и `ratings` (массив).
+
+        🔴 **В ответе персональные данные**: `legal_name` — ФИО предпринимателя, плюс
+        ИНН. Они не должны попадать ни в лог, ни в телеметрию: маскировать через
+        `mask_seller_info` всюду, где ответ не уходит прямо владельцу кабинета.
+
+        Именно этот метод отвечает на вопрос «что нам вообще доступно»: поисковая
+        аналитика требует Premium Plus или Pro, и без типа подписки планировать её
+        бессмысленно.
+        """
+        return await self._post("/v1/seller/info", {})
+
     async def company_info(self) -> dict:
         raise failures.EndpointRetired(
             "метода /v1/company/info в публичном Ozon API нет",

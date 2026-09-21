@@ -611,6 +611,41 @@ async def finish_run(db: aiosqlite.Connection, run_id: int, *, status: str,
     await db.commit()
 
 
+async def record_action(
+    db: aiosqlite.Connection, *, at: str, shop_id: str, object_kind: str,
+    object_id: str, field: str, actor: str, result: str,
+    value_before: str | None = None, value_after: str | None = None,
+    error: str | None = None,
+) -> int:
+    """Записать ДЕЙСТВИЕ (не вызов) в журнал.
+
+    🔴 Заводится сейчас, хотя запись в Ozon начнётся на этапе 2. Причина простая:
+    прежние значения ставок задним числом восстановить неоткуда. Журнал, заведённый
+    вместе с первой правкой, не помнит, что было до неё.
+
+    Пишутся и **несостоявшиеся** действия. Отказ режима только чтения — это тоже
+    действие, которое агент намеревался совершить, и к воротам этапа 2 («владелец
+    согласен с рекомендациями») именно эта запись отвечает на вопрос, что агент делал
+    бы, будь ему позволено. Без неё судить пришлось бы по памяти.
+    """
+    cursor = await db.execute(
+        "INSERT INTO action_log (at, shop_id, object_kind, object_id, field, "
+        "value_before, value_after, actor, result, error) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (at, shop_id, object_kind, object_id, field, value_before, value_after,
+         actor, result, error),
+    )
+    await db.commit()
+    return int(cursor.lastrowid)
+
+
+#: Исход действия. Перечень закрытый: свободная строка тут превратилась бы в свалку,
+#: по которой нельзя посчитать «сколько раз агенту не дали».
+ACTION_OK = "ok"
+ACTION_FAILED = "failed"
+ACTION_BLOCKED_READONLY = "blocked_readonly"
+
+
 def connection() -> aiosqlite.Connection:
     """Соединение для писателей. Не открыто — исключение, а не `None`."""
     if _db is None:

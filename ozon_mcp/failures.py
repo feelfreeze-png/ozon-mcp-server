@@ -158,3 +158,25 @@ def _first_list(payload: dict) -> Any:
 def _any_rows(payload: dict) -> bool:
     found = _first_list(payload)
     return bool(found)
+
+
+#: Поля ответа `/v1/seller/info`, которые нельзя показывать никому, кроме владельца
+#: кабинета, и нельзя писать в лог вообще. Замерено: `legal_name` — ФИО предпринимателя.
+SELLER_PII_FIELDS = ("legal_name", "inn", "ogrn")
+
+
+def mask_seller_info(payload: dict) -> dict:
+    """Скрыть персональные данные в ответе о продавце.
+
+    🔴 Маскируется по ИМЕНИ поля, а не по содержимому: угадывать ИНН по форме — значит
+    однажды не угадать. Поля не выбрасываются, а заменяются пометкой: исчезнувшее поле
+    неотличимо от поля, которого Ozon не прислал.
+    """
+    company = payload.get("company")
+    if not isinstance(company, dict):
+        return payload
+    masked = {
+        key: ("СКРЫТО" if key in SELLER_PII_FIELDS and value else value)
+        for key, value in company.items()
+    }
+    return {**payload, "company": masked}
