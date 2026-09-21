@@ -265,3 +265,60 @@ def test_the_report_carries_coverage_next_to_the_numbers():
     payload = built.as_dict()
     assert payload["coverage"] is FULL
     assert payload["период"] == PERIOD
+
+
+# ── Названия товаров ─────────────────────────────────────────────────────────
+
+NAMES = {101: "Пищевое ведро 8 л с крышкой, нержавейка",
+         102: "Сковорода 34 см, тройное дно"}
+
+
+def test_a_named_product_carries_its_name_everywhere_it_appears():
+    """Отчёт из одних чисел нельзя обсуждать с тем, кто ведёт ассортимент."""
+    rows = [_row(101, 42708950, 1464.99), _row(102, 42708950, 315.0, orders=2, sales=900.0)]
+    built = report.build(period=PERIOD, coverage=FULL, ad_rows=rows,
+                         kinds=report.campaign_kinds([CPC]), names=NAMES)
+
+    by_sku = {item["sku"]: item["товар"] for item in built.by_sku}
+    assert by_sku == NAMES
+    # Та же строка в аномалии: расход есть, заказов нет.
+    spend = built.anomalies["расход без заказов"]
+    assert [(item["sku"], item["товар"]) for item in spend] == [(101, NAMES[101])]
+
+
+def test_orders_without_stock_are_named_too():
+    rows = [_row(101, 42708950, 10.0, orders=3, sales=500.0)]
+    built = report.build(period=PERIOD, coverage=FULL, ad_rows=rows,
+                         kinds=report.campaign_kinds([CPC]), stock={}, names=NAMES)
+    assert built.anomalies["заказы без остатка"] == [
+        {"sku": 101, "товар": NAMES[101], "orders": 3}]
+
+
+def test_not_asking_for_names_leaves_no_empty_field():
+    """🔴 «Не спрашивали» и «спросили, не нашли» — разные утверждения.
+
+    Пустое поле «товар» читалось бы как «у товара нет имени», а это третье, неверное.
+    """
+    rows = [_row(101, 42708950, 10.0)]
+    built = report.build(period=PERIOD, coverage=FULL, ad_rows=rows,
+                         kinds=report.campaign_kinds([CPC]))
+    assert "товар" not in built.by_sku[0]
+    assert "товар" not in built.anomalies["расход без заказов"][0]
+
+
+def test_a_missing_name_is_null_and_is_reported():
+    """Ненайденное название — сигнал: каталог отстал либо карточки нет вовсе."""
+    rows = [_row(101, 42708950, 10.0), _row(999, 42708950, 5.0)]
+    built = report.build(period=PERIOD, coverage=FULL, ad_rows=rows,
+                         kinds=report.campaign_kinds([CPC]), names=NAMES)
+
+    by_sku = {item["sku"]: item["товар"] for item in built.by_sku}
+    assert by_sku[999] is None, "прочерк выглядел бы как товар без имени"
+    assert any("999" in note and "Названия не нашлись" in note for note in built.notes)
+
+
+def test_all_names_found_says_nothing():
+    rows = [_row(101, 42708950, 10.0)]
+    built = report.build(period=PERIOD, coverage=FULL, ad_rows=rows,
+                         kinds=report.campaign_kinds([CPC]), names=NAMES)
+    assert not [note for note in built.notes if "Названия не нашлись" in note]

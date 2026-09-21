@@ -1421,9 +1421,15 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
             total_orders = await analytics.orders_by_sku_day(
                 seller, date_from=day_from, date_to=day_to)
 
+        # Названия берутся из своего же каталога, без обращения к Ozon. Отчёт из одних
+        # чисел нельзя обсуждать с тем, кто ведёт ассортимент: «922567890» и «пищевое
+        # ведро 8 л» — это про один товар, но решение принимают по второму.
+        names = await series_read.names_for_skus(
+            db, shop_id=shop_id, skus=[r["sku"] for r in rows if r.get("sku")])
+
         built = report.build(
             period=raw["период"], coverage=raw["coverage"], ad_rows=rows,
-            kinds=kinds, total_orders=total_orders, stock=stock,
+            kinds=kinds, total_orders=total_orders, stock=stock, names=names,
             top=int(arguments.get("top") or 20))
         if kinds_error:
             built.notes.append(

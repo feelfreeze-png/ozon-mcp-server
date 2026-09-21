@@ -158,12 +158,19 @@ def build(
     kinds: dict[int, str] | None,
     total_orders: dict[tuple[int, str], int] | None = None,
     stock: dict[int, int] | None = None,
+    names: dict[int, str] | None = None,
     top: int = 20,
 ) -> Report:
     """Собрать отчёт из накопленного ряда.
 
     `ad_rows` — строки `ad_daily` в разрезе `sku × день × кампания`. `kinds` —
     классификация кампаний; `None` означает «неизвестна», и тогда ДРР не считается.
+
+    `names` — названия товаров по `sku`. `None` значит «не запрашивали», и тогда поля
+    «товар» в отчёте не будет вовсе: пустое поле читалось бы как «у товара нет имени».
+    Переданный словарь, в котором части `sku` не хватает, — другое утверждение, и оно
+    попадает в замечания: каталог отстал от рекламы либо товар рекламируется без
+    карточки. Список из одних чисел обсуждать с тем, кто ведёт ассортимент, нельзя.
     """
     report = Report(period=period, coverage=coverage)
 
@@ -219,6 +226,7 @@ def build(
         (
             {
                 "sku": sku,
+                **_named(sku, names),
                 "expense": round(values["expense"], 2),
                 "sales": round(values["sales"], 2),
                 "orders": int(values["orders"]),
@@ -230,6 +238,18 @@ def build(
         key=lambda item: item["expense"], reverse=True,
     )[:top]
 
+    if names is not None:
+        unnamed = sorted(sku for sku in per_sku if sku not in names)
+        if unnamed:
+            report.notes.append(
+                f"Названия не нашлись у {len(unnamed)} товаров с расходом "
+                f"({', '.join(str(s) for s in unnamed[:10])}"
+                f"{'…' if len(unnamed) > 10 else ''}). Это значит либо что каталог не "
+                "пересобран после появления товара, либо что sku рекламируется без "
+                "карточки. В отчёте у них стоит null, а не прочерк: прочерк выглядел "
+                "бы как товар без имени."
+            )
+
     if total_orders is not None:
         report.total_orders = sum(total_orders.values())
         if report.total_orders > 0:
@@ -240,18 +260,31 @@ def build(
                 "знаменателе это не «ноль процентов», а «не из чего считать»."
             )
 
-    report.anomalies = _anomalies(per_sku, coverage, stock)
+    report.anomalies = _anomalies(per_sku, coverage, stock, names)
     return report
+
+
+def _named(sku: int, names: dict[int, str] | None) -> dict[str, Any]:
+    """Поле «товар» — или его отсутствие, если названий не запрашивали.
+
+    Три разных утверждения не сводятся к одному: «не спрашивали» (ключа нет),
+    «спросили, не нашли» (`null`) и «вот название». Прочерк вместо `null` стёр бы
+    границу между вторым и третьим.
+    """
+    if names is None:
+        return {}
+    return {"товар": names.get(int(sku))}
 
 
 def _anomalies(
     per_sku: dict[int, dict[str, float]],
     coverage: dict[str, Any],
     stock: dict[int, int] | None,
+    names: dict[int, str] | None = None,
 ) -> dict[str, list[Any]]:
     """Три аномалии, названные в спецификации."""
     spend_without_orders = sorted(
-        ({"sku": sku, "expense": round(v["expense"], 2)}
+        ({"sku": sku, **_named(sku, names), "expense": round(v["expense"], 2)}
          for sku, v in per_sku.items() if v["expense"] > 0 and v["orders"] == 0),
         key=lambda item: item["expense"], reverse=True,
     )
@@ -262,7 +295,7 @@ def _anomalies(
     else:
         orders_without_stock = sorted(
             (
-                {"sku": sku, "orders": int(values["orders"])}
+                {"sku": sku, **_named(sku, names), "orders": int(values["orders"])}
                 for sku, values in per_sku.items()
                 if values["orders"] > 0 and not stock.get(sku)
             ),

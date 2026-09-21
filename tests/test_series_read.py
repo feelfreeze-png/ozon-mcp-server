@@ -260,3 +260,94 @@ async def test_stock_sources_are_never_mixed(db):
     report = await series_read.stock_series(db, shop_id="main", date_from=WEEK[0],
                                             date_to=WEEK[0], source="placement_report")
     assert [row["qty"] for row in report["rows"]] == [11]
+
+
+# ── Названия товаров ─────────────────────────────────────────────────────────
+
+
+async def _card(conn, product_id, sku, name, *, shop="main", offer=None):
+    await conn.execute(
+        "INSERT INTO product (product_id, shop_id, offer_id, name, archived, updated_at) "
+        "VALUES (?, ?, ?, ?, 0, ?)",
+        (product_id, shop, offer or f"A{product_id}", name, tz.now_msk_iso()))
+    await conn.execute(
+        "INSERT INTO product_sku (product_id, shop_id, sku, source) VALUES (?, ?, ?, 'sds')",
+        (product_id, shop, sku))
+    await conn.commit()
+
+
+@pytest.mark.asyncio
+async def test_names_come_back_by_sku(db):
+    await _card(db, 1, 101, "Пищевое ведро 8 л")
+    await _card(db, 2, 102, "Сковорода 34 см")
+    got = await series_read.names_for_skus(db, shop_id="main", skus=[101, 102])
+    assert got == {101: "Пищевое ведро 8 л", 102: "Сковорода 34 см"}
+
+
+@pytest.mark.asyncio
+async def test_two_skus_of_one_card_share_its_name(db):
+    """У карточки бывает два `sku` — оба должны находиться."""
+    await _card(db, 1, 101, "Пищевое ведро 8 л")
+    await db.execute(
+        "INSERT INTO product_sku (product_id, shop_id, sku, source) VALUES (1, 'main', 202, 'fbo')")
+    await db.commit()
+    got = await series_read.names_for_skus(db, shop_id="main", skus=[101, 202])
+    assert got == {101: "Пищевое ведро 8 л", 202: "Пищевое ведро 8 л"}
+
+
+@pytest.mark.asyncio
+async def test_a_sku_without_a_card_is_absent_not_blank(db):
+    """🔴 Пропуск обязан быть виден: его причина — отставший каталог."""
+    await _card(db, 1, 101, "Пищевое ведро 8 л")
+    got = await series_read.names_for_skus(db, shop_id="main", skus=[101, 999])
+    assert got == {101: "Пищевое ведро 8 л"}
+    assert 999 not in got
+
+
+@pytest.mark.asyncio
+async def test_an_empty_name_is_not_a_name(db):
+    """Пустая строка в отчёте выглядит как название из пробела."""
+    await _card(db, 1, 101, "   ")
+    await _card(db, 2, 102, None)
+    assert await series_read.names_for_skus(db, shop_id="main", skus=[101, 102]) == {}
+
+
+@pytest.mark.asyncio
+async def test_a_neighbours_name_is_not_returned(db):
+    """Таблицы общие для арендаторов — разделение колонкой, а не доверием."""
+    await _card(db, 1, 101, "Чужое ведро", shop="другой")
+    assert await series_read.names_for_skus(db, shop_id="main", skus=[101]) == {}
+
+
+@pytest.mark.asyncio
+async def test_batches_are_assembled_without_losing_or_doubling_rows(db):
+    """Сборка из нескольких порций обязана дать то же, что дал бы один запрос.
+
+    ⚠️ Прежняя редакция называлась «sku больше, чем SQLite берёт одним IN» и опиралась
+    на предел в 999 параметров. Мутационная проверка показала, что тест проходит и при
+    порции 5000, то есть не доказывает ничего: предел замерен и равен **32 766** у
+    разработчика (sqlite 3.50.4) и **250 000** на проде (3.46.1) — 999 снят в 3.32.
+    Настоящий дефект здесь другой: потерянная или задвоенная порция. Его и ловим —
+    1200 `sku` при порции 400 это ровно три прохода.
+    """
+    assert series_read._NAME_BATCH * 2 < 1200, "порция выросла — тест перестал бить по швам"
+    for i in range(1200):
+        await db.execute(
+            "INSERT INTO product (product_id, shop_id, offer_id, name, archived, updated_at) "
+            "VALUES (?, 'main', ?, ?, 0, ?)",
+            (i, f"A{i}", f"Товар {i}", tz.now_msk_iso()))
+        await db.execute(
+            "INSERT INTO product_sku (product_id, shop_id, sku, source) "
+            "VALUES (?, 'main', ?, 'sds')", (i, 1000 + i))
+    await db.commit()
+
+    got = await series_read.names_for_skus(
+        db, shop_id="main", skus=list(range(1000, 2200)))
+    assert len(got) == 1200
+    assert got[1000] == "Товар 0" and got[2199] == "Товар 1199"
+
+
+@pytest.mark.asyncio
+async def test_an_empty_request_asks_the_database_nothing(db):
+    assert await series_read.names_for_skus(db, shop_id="main", skus=[]) == {}
+    assert await series_read.names_for_skus(db, shop_id="main", skus=[None]) == {}

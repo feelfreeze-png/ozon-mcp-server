@@ -20,12 +20,26 @@ backend платформы нет ключей Ozon. Ряд накапливае
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import date, timedelta
 from typing import Any
 
 import aiosqlite
 
 from . import timezones
+
+#: Порция `sku` в запросе названий.
+#:
+#: ⚠️ Первая редакция обосновывала её тем, что «SQLite держит 999 параметров». Замер
+#: 21.09.2026 показал, что это неверно и — что важнее — **величина разная в разных
+#: местах**: на машине разработки `SQLITE_LIMIT_VARIABLE_NUMBER` = 32 766 (sqlite
+#: 3.50.4), в боевом контейнере — 250 000 (sqlite 3.46.1). Предел 999 исторический,
+#: снят в 3.32.
+#:
+#: Отсюда и размер: 400 безопасно всюду. Обосновывать порцию пределом, который у
+#: разработчика и на проде отличается в восемь раз, значит проверять её не там, где
+#: она сработает.
+_NAME_BATCH = 400
 
 #: Разрезы. Ключ — имя наружу, значение — колонки группировки.
 GROUPINGS: dict[str, tuple[str, ...]] = {
@@ -262,3 +276,35 @@ async def stock_on_day(
         (shop_id, day, source),
     ) as cur:
         return {int(sku): int(qty or 0) for sku, qty in await cur.fetchall()}
+
+
+async def names_for_skus(
+    db: aiosqlite.Connection, *, shop_id: str, skus: Iterable[int],
+) -> dict[int, str]:
+    """Названия товаров по их `sku`. В словаре только то, что нашлось.
+
+    🔴 Отсутствие `sku` в ответе — не пустяк и не повод подставить прочерк. Оно значит
+    ровно одно из двух: либо каталог не пересобран после появления товара, либо `sku`
+    рекламируется, а карточки под него нет. Оба случая обязан увидеть тот, кто читает
+    отчёт, поэтому словарь возвращается неполным, а достраивает его — и называет
+    пропуск — вызывающий.
+
+    Пустое имя в базе к выдаче не приравнивается к найденному: пустая строка в отчёте
+    выглядит как название из пробела и читается как «название есть».
+    """
+    wanted = sorted({int(sku) for sku in skus if sku is not None})
+    if not wanted:
+        return {}
+    found: dict[int, str] = {}
+    for batch in (wanted[i:i + _NAME_BATCH] for i in range(0, len(wanted), _NAME_BATCH)):
+        async with db.execute(
+            "SELECT s.sku, p.name FROM product_sku s "
+            "JOIN product p ON p.product_id = s.product_id AND p.shop_id = s.shop_id "
+            f"WHERE s.shop_id = ? AND s.sku IN ({', '.join('?' * len(batch))})",
+            (shop_id, *batch),
+        ) as cur:
+            for sku, name in await cur.fetchall():
+                text = (name or "").strip()
+                if text:
+                    found[int(sku)] = text
+    return found
