@@ -35,7 +35,9 @@ from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
 from ozon_mcp import readonly, shaping, tenancy, toolsets
-from ozon_mcp.client import OzonSellerClient, OzonPerformanceClient
+from ozon_mcp.client import (
+    OzonSellerClient, OzonPerformanceClient, normalize_sku_rows,
+)
 
 # ─── Инициализация ────────────────────────────────────────
 
@@ -474,6 +476,16 @@ TOOLS = [
           "[P0] CPC campaign stats per product: spend, CTR, CPC, orders, ДРР. Synchronous (статистика по товарам).",
           {"campaigns": NUMERIC_ID_ARRAY,
            "date_from": {"type": "string"}, "date_to": {"type": "string"}},
+          ["campaigns", "date_from", "date_to"]),
+    _tool("ozon_ad_statistics_products_sku",
+          "[P0] Ad spend and orders PER SKU for a single day: sku, campaign_id, expense, "
+          "views, clicks, to_cart, orders, model_orders, sales, model_sales, price. "
+          "Window is TODAY or YESTERDAY only (Moscow days) — Ozon rejects anything else. "
+          "ctr is computed from clicks/views, not taken from the response "
+          "(расход и заказы по SKU за день; окно — только сегодня и вчера).",
+          {"campaigns": NUMERIC_ID_ARRAY,
+           "date_from": {"type": "string", "description": "YYYY-MM-DD, московские сутки"},
+           "date_to": {"type": "string", "description": "YYYY-MM-DD, московские сутки"}},
           ["campaigns", "date_from", "date_to"]),
     _tool("ozon_ad_balance",
           "Ad account balance; no official method, see spend in ozon_ad_statistics_expenses (баланс рекламы)."),
@@ -1251,6 +1263,14 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
     if name == "ozon_search_promo_bids":
         p = _get_perf(shop_id)
         return _json(await p.search_promo_cpo_bids(arguments["skus"]))
+    if name == "ozon_ad_statistics_products_sku":
+        p = _get_perf(shop_id)
+        raw = await p.statistics_products_sku(
+            arguments["campaigns"], arguments["date_from"], arguments["date_to"])
+        # Наружу уходят нормализованные строки: сырой ответ несёт ctr в неизвестной
+        # конвенции и числа с разделителем, отличным от соседних методов.
+        return _json({"rows": normalize_sku_rows(raw), "date_from": arguments["date_from"],
+                      "date_to": arguments["date_to"], "_tz": "московские сутки"})
     if name == "ozon_ad_statistics_products":
         p = _get_perf(shop_id)
         return _json(await p.statistics_products(arguments["campaigns"], arguments["date_from"], arguments["date_to"]))

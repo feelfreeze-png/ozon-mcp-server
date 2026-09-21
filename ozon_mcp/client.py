@@ -5,7 +5,7 @@ import re
 import httpx
 from datetime import datetime, timedelta, timezone
 
-from . import timezones
+from . import numbers, timezones
 from typing import Any
 
 SELLER_BASE = "https://api-seller.ozon.ru"
@@ -1194,6 +1194,70 @@ class OzonSellerClient:
         await self._http.aclose()
 
 
+#: Поля строки `products/sku`: имя в ответе → (имя у нас, как разбирать).
+_SKU_ROW_FIELDS: dict[str, tuple[str, str]] = {
+    "sku": ("sku", "int"),
+    "campaignId": ("campaign_id", "int"),
+    "date": ("date_msk", "day"),
+    "expense": ("expense", "number"),
+    "views": ("views", "int"),
+    "clicks": ("clicks", "int"),
+    "toCart": ("to_cart", "int"),
+    "orders": ("orders", "int"),
+    "modelOrders": ("model_orders", "int"),
+    "sales": ("sales", "number"),
+    "modelSales": ("model_sales", "number"),
+    "price": ("price", "number"),
+}
+
+
+def normalize_sku_rows(payload: Any) -> list[dict[str, Any]]:
+    """Привести ответ `products/sku` к строкам, готовым для `ad_daily`.
+
+    ⚠️ **`ctr` и `drr` из ответа отбрасываются намеренно.** Три метода Performance API
+    отдают поле `ctr` по трём разным конвенциям, и какая из них здесь — не замерено.
+    Число, посчитанное не по той конвенции, ничем не отличается от верного. `ctr`
+    считаем сами из `clicks`/`views`, `drr` — из `expense`/`sales` на этапе отчёта.
+
+    ⚠️ `date` здесь — **московские сутки**, а не метка времени: не переводить
+    (`timezones.FIELD_KINDS`).
+
+    Неизвестные поля не выбрасываются молча: они попадают в `_unknown`, чтобы
+    изменение формы ответа Ozon было видно, а не растворилось.
+    """
+    rows = payload
+    if isinstance(payload, dict):
+        rows = payload.get("rows") or payload.get("result") or payload.get("report") or []
+    if not isinstance(rows, list):
+        raise ValueError(
+            f"products/sku: ожидался список строк, получено {type(rows).__name__}"
+        )
+
+    out: list[dict[str, Any]] = []
+    for raw in rows:
+        if not isinstance(raw, dict):
+            raise ValueError(f"products/sku: строка не объект, а {type(raw).__name__}")
+        row: dict[str, Any] = {}
+        for source, (name, kind) in _SKU_ROW_FIELDS.items():
+            if source not in raw:
+                row[name] = None
+                continue
+            value = raw[source]
+            if kind == "int":
+                row[name] = numbers.parse_int(value, field=source)
+            elif kind == "number":
+                row[name] = numbers.parse_number(value, field=source)
+            else:
+                row[name] = timezones.require_plain_day(str(value), source)
+        views, clicks = row.get("views"), row.get("clicks")
+        row["ctr"] = (clicks / views) if views else None
+        unknown = sorted(set(raw) - set(_SKU_ROW_FIELDS) - {"ctr", "drr", "avgCpc"})
+        if unknown:
+            row["_unknown"] = {key: raw[key] for key in unknown}
+        out.append(row)
+    return out
+
+
 class OzonPerformanceClient:
     """Клиент для Ozon Performance API (реклама).
 
@@ -1435,6 +1499,63 @@ class OzonPerformanceClient:
         if campaigns:
             params["campaignIds"] = [str(c) for c in campaigns]
         return await self._get("/api/client/statistics/expense/json", params)
+
+    #: Окно `products/sku` — только сегодня и вчера. Замерено живым вызовом: вне окна
+    #: приходит `400 date range must contain only today or yesterday`.
+    PRODUCTS_SKU_WINDOW = "сегодня и вчера"
+
+    @staticmethod
+    def check_products_sku_window(date_from: str, date_to: str) -> None:
+        """Окно съёма — только сегодня и вчера по МСК.
+
+        Проверяем у себя, а не ждём 400 от Ozon: его текст уйдёт наверх строкой
+        «Ошибка: …», а причина потеряется. Свой отказ называет и окно, и то, что
+        пропущенный день уже не переснять.
+        """
+        allowed = {timezones.today_msk(), timezones.yesterday_msk()}
+        outside = sorted({date_from, date_to} - allowed)
+        if outside:
+            raise ValueError(
+                f"products/sku отдаёт только сегодня и вчера по МСК ({sorted(allowed)}), "
+                f"запрошено {outside}. За пределами окна Ozon отвечает 400, и день уже "
+                "не переснять — его собирают в те же сутки."
+            )
+
+    async def statistics_products_sku(
+        self, campaigns: list[int], date_from: str, date_to: str,
+        *, check_window: bool = True,
+    ) -> dict:
+        """POST /api/client/statistics/products/sku — расход и заказы ПО SKU за день.
+
+        Основной источник этапа 1. Контракт выверен живым вызовом на боевом кабинете.
+
+        🔴 **Поле кампаний — только `campaignIds` или `campaign_ids`.** Привычное по
+        остальным методам клиента `campaigns` даёт `400 {"error":"empty campaigns"}`:
+        API утверждает, что кампаний не передали, хотя их передали, и наверху это
+        читается как «у аккаунта нет кампаний».
+
+        ⚠️ Тело здесь в snake_case (`date_from`/`date_to`), а не `dateFrom`/`dateTo`,
+        как у соседних методов.
+
+        ⚠️ Окно — только сегодня и вчера (`check_products_sku_window`).
+
+        ⚠️ Разделитель дробной части в ответе — **точка** (`"1256.36"`), тогда как в
+        остальных методах запятая. Разбирать только через `numbers.parse_number`.
+
+        ⚠️ **`ctr` из ответа не читать** — три метода под этим именем дают три разные
+        конвенции. Считаем сами из `clicks` и `views` (`normalize_sku_rows`).
+
+        Замерено: 30 `campaignIds` проходят за 0,20 с; потолок не нащупан.
+        """
+        if check_window:
+            self.check_products_sku_window(date_from, date_to)
+        body = {
+            "date_from": date_from,
+            "date_to": date_to,
+            "campaignIds": [str(c) for c in campaigns],
+        }
+        timezones.check_statistics_period(body)
+        return await self._post("/api/client/statistics/products/sku", body)
 
     async def statistics_products(self, campaigns: list[int], date_from: str, date_to: str) -> dict:
         """GET /api/client/statistics/campaign/product/json — статистика CPC-кампаний по товарам: расход, CTR, CPC, заказы, ДРР."""
