@@ -36,7 +36,8 @@ RULES: tuple[tuple[str, str], ...] = (
     ("orders",    r"^ozon_(order|orders|supply|warehouse|delivery|cancellation|carriage)"),
     # placement_zone — в analytics, а не в catalog: читается вместе с остатками
     # («можно ли этот товар вообще поставить»), а не с карточкой товара.
-    ("analytics", r"^ozon_(analytics|stock_on|search_queries|report|rating|placement_zone)"),
+    # `stock_series` — чтение накопленного ряда остатков: это аналитика, а не склад.
+    ("analytics", r"^ozon_(analytics|stock_on|stock_series|search_queries|report|rating|placement_zone)"),
     ("feedback",  r"^ozon_(review|question|chat|returns)"),
     ("finance",   r"^ozon_finance"),
 )

@@ -34,7 +34,9 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from ozon_mcp import failures, readonly, shaping, tenancy, toolsets
+from ozon_mcp import (
+    failures, readonly, series, series_read, shaping, tenancy, toolsets,
+)
 from ozon_mcp.client import (
     OzonSellerClient, OzonPerformanceClient, normalize_sku_rows,
 )
@@ -501,6 +503,33 @@ TOOLS = [
            "date_from": {"type": "string", "description": "YYYY-MM-DD, московские сутки"},
            "date_to": {"type": "string", "description": "YYYY-MM-DD, московские сутки"}},
           ["campaigns", "date_from", "date_to"]),
+    _tool("ozon_ad_series",
+          "[P0] READ THE ACCUMULATED AD SERIES from local storage — no Ozon call, so no "
+          "rate limits and history beyond the today/yesterday window. Period in Moscow "
+          "days, group_by: day | sku | campaign | sku_day | campaign_day. "
+          "Returns coverage (which days were collected, failed, or never attempted), "
+          "rows and totals. EMPTY rows with full coverage means zero spend; empty rows "
+          "with gaps means UNKNOWN — read coverage before concluding. "
+          "ДРР is deliberately NOT computed here, see ozon_ad_report "
+          "(чтение накопленного рекламного ряда; покрытие идёт вместе с данными).",
+          {"date_from": {"type": "string", "description": "YYYY-MM-DD, МСК"},
+           "date_to": {"type": "string", "description": "YYYY-MM-DD, МСК"},
+           "group_by": {"type": "string",
+                        "description": "day | sku | campaign | sku_day | campaign_day"},
+           "skus": NUMERIC_ID_ARRAY,
+           "campaigns": NUMERIC_ID_ARRAY,
+           "limit": {"type": "integer"}},
+          ["date_from", "date_to"]),
+    _tool("ozon_stock_series",
+          "Read the accumulated STOCK series from local storage. source: snapshot "
+          "(measured stock) or placement_report (billing quantity) — they are different "
+          "quantities and are never mixed "
+          "(чтение накопленного ряда остатков; источники не смешиваются).",
+          {"date_from": {"type": "string"}, "date_to": {"type": "string"},
+           "skus": NUMERIC_ID_ARRAY,
+           "source": {"type": "string", "description": "snapshot | placement_report"},
+           "limit": {"type": "integer"}},
+          ["date_from", "date_to"]),
     _tool("ozon_ad_balance",
           "Ad account balance; no official method, see spend in ozon_ad_statistics_expenses (баланс рекламы)."),
 
@@ -1303,6 +1332,27 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
     if name == "ozon_search_promo_bids":
         p = _get_perf(shop_id)
         return _json(await p.search_promo_cpo_bids(arguments["skus"]))
+    if name in ("ozon_ad_series", "ozon_stock_series"):
+        # Читаем СВОЁ хранилище, а не Ozon: ключей для этого не нужно, зато нужен
+        # магазин — таблицы общие, разделение колонкой.
+        if not series.is_enabled():
+            raise failures.OzonBusinessError(
+                "хранилище накопленного ряда не открыто: читать нечего. Это НЕ значит "
+                "«данных нет» — это значит, что база недоступна.",
+                endpoint="series.db")
+        db = series.connection()
+        if name == "ozon_ad_series":
+            return _json(await series_read.ad_series(
+                db, shop_id=shop_id, date_from=arguments["date_from"],
+                date_to=arguments["date_to"],
+                group_by=arguments.get("group_by") or "day",
+                skus=arguments.get("skus"), campaigns=arguments.get("campaigns"),
+                limit=int(arguments.get("limit") or series_read.MAX_ROWS)))
+        return _json(await series_read.stock_series(
+            db, shop_id=shop_id, date_from=arguments["date_from"],
+            date_to=arguments["date_to"], skus=arguments.get("skus"),
+            source=arguments.get("source") or "snapshot",
+            limit=int(arguments.get("limit") or series_read.MAX_ROWS)))
     if name == "ozon_ad_statistics_products_sku":
         p = _get_perf(shop_id)
         raw = await p.statistics_products_sku(
@@ -1670,6 +1720,15 @@ async def _init_stats() -> bool:
 
     try:
         await stats.init_db(DATA_DIR)
+        # Ряд открываем и здесь: инструменты чтения (E2) работают и по stdio, где
+        # жизненного цикла приложения нет. Отказ не прячем — без него чтение ряда
+        # обязано говорить «база недоступна», а не «данных нет».
+        try:
+            await series.init_db(DATA_DIR)
+        except Exception as exc:
+            print(f"ВНИМАНИЕ: хранилище ряда не открылось ({type(exc).__name__}: {exc}); "
+                  "инструменты чтения ряда будут отвечать отказом, а не пустотой",
+                  file=__import__("sys").stderr, flush=True)
     except Exception:
         return False
     set_stats_callback(stats.record_call)
