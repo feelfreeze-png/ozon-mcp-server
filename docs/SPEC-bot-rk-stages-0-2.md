@@ -117,7 +117,11 @@ product_id ─┬─ offer_id (1:1)
 `POST /v1/seller/info`. ⚠️ **Не реализован**; инструменты группы «Компания» — заглушки,
 отвечающие на несуществующий путь и возвращающие поле `error` с кодом 200 (§ 9).
 
-От подписки зависит доступность поисковой аналитики (Premium Plus и Pro) и отзывов.
+От подписки зависит доступность поисковой аналитики и отзывов. ⚠️ **Замерено 21.09.2026:
+уровни различаются между собой.** При `PREMIUM_PLUS` `/v1/analytics/product-queries` и
+`/product-queries/details` работают, а `/v1/search-queries/top` отвечает 403 с текстом
+«Method available with Premium Pro subscription». Писать «Premium Plus и Pro» как об одном
+пороге нельзя — подробности в `docs/PLAN-search-analytics.md`.
 
 ### 4.3. Журнал действий
 
