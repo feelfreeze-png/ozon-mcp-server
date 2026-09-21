@@ -23,9 +23,10 @@ AD_INSERT = (f"INSERT OR REPLACE INTO ad_daily ({AD_COLUMNS}) "
 class FakeSeller:
     """Кабинет с курсорной пагинацией: отдаёт страницы и считает вызовы."""
 
-    def __init__(self, pages_by_visibility, sources=None):
+    def __init__(self, pages_by_visibility, sources=None, names=None):
         self.pages = {k: list(v) for k, v in pages_by_visibility.items()}
         self.sources = dict(sources or {})
+        self.names = dict(names or {})
         self.calls = []
 
     async def product_list(self, limit=100, last_id="", visibility="ALL"):
@@ -36,14 +37,24 @@ class FakeSeller:
         return {"result": {"items": items, "last_id": cursor, "total": total}}
 
     async def product_info_list(self, product_id):
-        """Второй источник: только он отдаёт `sources` со схемами."""
+        """Второй источник: только он отдаёт `sources` со схемами — и `name`."""
         self.calls.append(("info", tuple(product_id)))
-        return {"items": [{"id": pid, "sources": self.sources.get(pid, [])}
+        return {"items": [{"id": pid,
+                           "sources": self.sources.get(pid, []),
+                           "name": self.names.get(pid, f"Товар {pid}")}
                           for pid in product_id]}
 
 
-def _product(product_id, offer, name="Товар", **skus):
-    return {"product_id": product_id, "offer_id": offer, "name": name, **skus}
+def _product(product_id, offer, **skus):
+    """Строка `/v3/product/list` — **без `name`**.
+
+    🔴 Прежняя редакция подставляла сюда `name="Товар"`, и этого поля в живом ответе
+    нет. Двойник был щедрее кабинета, поэтому тесты на пересборку зеленели, а на проде
+    колонка `name` стояла пустой у всех 887 карточек. Дыру нашли глазами в выдаче, а не
+    прогоном — ровно потому, что проверять было нечего: двойник отвечал за Ozon то,
+    чего Ozon не говорит. Состав полей обоих ответов замерен 21.09.2026.
+    """
+    return {"product_id": product_id, "offer_id": offer, **skus}
 
 
 @pytest.fixture(autouse=True)
@@ -309,3 +320,75 @@ async def test_an_unfamiliar_scheme_is_surfaced(db):
                         sources={1: [{"sku": 11, "source": "невиданная_схема"}]})
     result = await catalogue.rebuild(seller, db, shop_id="main")
     assert result.detail["незнакомые схемы"] == ["невиданная_схема"]
+
+
+# ── Название товара ──────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_name_is_taken_from_the_second_source(db):
+    """🔴 Сторож против дыры, прожившей до 21.09.2026.
+
+    `rebuild` читал `name` из строки `/v3/product/list`, где его нет, и колонка стояла
+    пустой у всех карточек кабинета. Запрос за названием при этом не терялся: ответ с
+    ним уже приходил вторым источником и выбрасывался. Проверяется именно то, что до
+    базы доехало название, а не то, что его кто-то запросил.
+    """
+    seller = FakeSeller({"ALL": [([_product(1, "A1"), _product(2, "A2")], "", 2)],
+                         "ARCHIVED": [([], "", 0)]},
+                        names={1: "Чекодержатель 60 см", 2: "Сковорода 34 см"})
+    await catalogue.rebuild(seller, db, shop_id="main")
+
+    assert await _rows(db, "SELECT product_id, name FROM product ORDER BY product_id") == [
+        (1, "Чекодержатель 60 см"), (2, "Сковорода 34 см")]
+
+
+@pytest.mark.asyncio
+async def test_a_card_without_a_name_is_null_not_empty(db):
+    """`None` и `''` читаются по-разному: пустая строка выглядит как имя из пробела."""
+    seller = FakeSeller({"ALL": [([_product(1, "A1")], "", 1)], "ARCHIVED": [([], "", 0)]},
+                        names={1: "   "})
+    await catalogue.rebuild(seller, db, shop_id="main")
+    assert await _rows(db, "SELECT name FROM product") == [(None,)]
+
+
+@pytest.mark.asyncio
+async def test_cards_left_without_a_name_are_counted(db):
+    """Неполнота обязана быть названа, иначе `offer_id` в отчёте сойдёт за решение."""
+    class Nameless(FakeSeller):
+        async def product_info_list(self, product_id):
+            self.calls.append(("info", tuple(product_id)))
+            return {"items": [{"id": pid, "sources": [], "name": ""}
+                              for pid in product_id]}
+
+    seller = Nameless({"ALL": [([_product(1, "A1"), _product(2, "A2")], "", 2)],
+                       "ARCHIVED": [([], "", 0)]})
+    result = await catalogue.rebuild(seller, db, shop_id="main")
+    assert result.detail["без названия"] == [1, 2]
+    assert result.detail["без названия, всего"] == 2
+
+
+@pytest.mark.asyncio
+async def test_a_full_catalogue_says_nothing_about_names(db):
+    """Обратная сторона: когда названия на месте, замечания быть не должно."""
+    seller = FakeSeller({"ALL": [([_product(1, "A1")], "", 1)], "ARCHIVED": [([], "", 0)]})
+    result = await catalogue.rebuild(seller, db, shop_id="main")
+    assert "без названия" not in result.detail
+
+
+@pytest.mark.asyncio
+async def test_the_name_survives_a_card_the_second_source_skipped(db):
+    """Пропущенная карточка остаётся без имени — и это попадает в оба замечания."""
+    class Partial(FakeSeller):
+        async def product_info_list(self, product_id):
+            self.calls.append(("info", tuple(product_id)))
+            return {"items": [{"id": product_id[0], "sources": [], "name": "Ведро 12 л"}]}
+
+    seller = Partial({"ALL": [([_product(1, "A1"), _product(2, "A2")], "", 2)],
+                      "ARCHIVED": [([], "", 0)]})
+    result = await catalogue.rebuild(seller, db, shop_id="main")
+
+    assert await _rows(db, "SELECT product_id, name FROM product ORDER BY product_id") == [
+        (1, "Ведро 12 л"), (2, None)]
+    assert result.detail["без второго источника"] == [2]
+    assert result.detail["без названия"] == [2]

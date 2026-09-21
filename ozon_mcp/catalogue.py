@@ -179,11 +179,18 @@ def extract_skus(item: dict) -> list[tuple[int, str | None]]:
 async def enrich_with_sources(
     seller: Any, products: list[dict], *, result: CatalogueResult | None = None,
 ) -> list[dict]:
-    """Дочитать `sources` из `/v3/product/info/list` порциями.
+    """Дочитать `sources` **и `name`** из `/v3/product/info/list` порциями.
 
     Порция и пауза — из `limits`, с записанным происхождением. Карточка, по которой
     второй источник не ответил, **не** остаётся с одним `sku` молча: её `product_id`
     попадает в `detail`, потому что молчаливая неполнота здесь неотличима от полноты.
+
+    🔴 **Название берётся отсюда, и только отсюда.** `/v3/product/list` его не несёт —
+    замерено 21.09.2026 составом полей обоих ответов. До этой правки `rebuild` читал
+    `name` из строки первого источника, то есть из места, где его нет, и колонка
+    оставалась пустой у ВСЕХ карточек кабинета. Отказ был бесшумным: пустое имя ничем
+    не отличалось от карточки без имени, а запроса за названием никто не терял —
+    ответ с ним уже приходил и выбрасывался здесь же, строкой ниже.
     """
     by_id = {numbers.parse_int(p.get("product_id"), field="product_id"): p
              for p in products}
@@ -203,6 +210,11 @@ async def enrich_with_sources(
             if product_id not in by_id:
                 continue
             by_id[product_id]["sources"] = row.get("sources") or []
+            # Пустую строку не пишем: `None` честнее, чем название нулевой длины,
+            # которое в отчёте выглядит как пробел и читается как «имя есть».
+            name = (row.get("name") or "").strip()
+            if name:
+                by_id[product_id]["name"] = name
             for entry in by_id[product_id]["sources"]:
                 name = (entry or {}).get("source")
                 if name and name not in KNOWN_SOURCES:
@@ -247,7 +259,8 @@ async def rebuild(
     seen_sku: dict[int, int] = {}
     for item in merged:
         product_id = numbers.parse_int(item.get("product_id"), field="product_id")
-        products.append((product_id, shop_id, item.get("offer_id"), item.get("name"),
+        name = (item.get("name") or "").strip() or None
+        products.append((product_id, shop_id, item.get("offer_id"), name,
                          int(item.get("archived", 0)), now))
         skus = extract_skus(item)
         if len(skus) > 1:
@@ -279,11 +292,18 @@ async def rebuild(
     # ⚠️ Именно `update`, а не присваивание: в `detail` уже лежат названные аномалии
     # второго источника (карточки без `sources`, незнакомые схемы). Присваивание их
     # стирало — и пересборка выглядела безупречной ровно тогда, когда было что сказать.
+    # Карточка без названия — неполнота, и она обязана быть названа. Пустое `name`
+    # ничем не отличается от «у товара нет имени», а именно так дыра и прожила: в
+    # отчёте вместо названия стоял `offer_id`, и это выглядело решением, а не потерей.
+    nameless = [row[0] for row in products if not row[3]]
     result.detail.update({
         "товаров активных": result.active,
         "товаров архивных": result.archived,
         "карточек с несколькими sku": result.multi_sku_products,
     })
+    if nameless:
+        result.detail["без названия"] = nameless[:20]
+        result.detail["без названия, всего"] = len(nameless)
     return result
 
 
