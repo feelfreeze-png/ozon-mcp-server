@@ -270,3 +270,65 @@ class _FakeCatalogue:
     async def product_info_list(self, product_id):
         return {"items": [{"id": pid, "sources": self.sources.get(pid, [])}
                           for pid in product_id]}
+
+
+# ── Миграция 4: снимок и бэкфилл лежат РЯДОМ, а не поверх ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_backfill_does_not_eat_the_snapshot(db):
+    """🔴 Отрицательный сторож против дефекта, заложенного в A3.
+
+    Прежний ключ `(date_msk, sku, warehouse, shop_id)` не включал `source`, а запись
+    идёт через `INSERT OR REPLACE`. Проверено прогоном на той DDL: строка бэкфилла с тем
+    же ключом оставляла `count(*) = 1`, и выживал `placement_report`. То есть бэкфилл не
+    «смешивался» со снимком, как опасается ТЗ, а молча СЪЕДАЛ его: измеренный остаток
+    подменялся величиной тарификации.
+
+    Цена дефекта — вся приёмка D4. «Доля SKU с совпадением qty за день, где есть и
+    снимок, и бэкфилл» на прежнем ключе невычислима: сравнивать не с чем уже в момент
+    записи, а прогон при этом закрывается как успешный.
+    """
+    day = tz.today_msk()
+    stamped = tz.now_msk_iso()
+    common = dict(date_msk=day, sku=1, warehouse="100", shop_id="main",
+                  fetched_at=stamped, warehouse_name="ХАБАРОВСК_2_РФЦ",
+                  cluster_name="Дальний Восток", breakdown=None)
+
+    await series.upsert_stock_daily(db, [{**common, "source": "snapshot", "qty": 3}])
+    await series.upsert_stock_daily(
+        db, [{**common, "source": "placement_report", "qty": 11}])
+
+    rows = await _rows(db, "SELECT source, qty FROM stock_daily ORDER BY source")
+    assert rows == [("placement_report", 11), ("snapshot", 3)], (
+        "бэкфилл и снимок обязаны лежать рядом: иначе сверять D4 не с чем"
+    )
+
+
+@pytest.mark.asyncio
+async def test_repeat_of_the_same_source_still_overwrites(db):
+    """Повтор ОДНОГО источника по-прежнему перезаписывает — иначе день задвоится."""
+    day = tz.today_msk()
+    common = dict(date_msk=day, sku=1, warehouse="100", shop_id="main",
+                  source="snapshot", fetched_at=tz.now_msk_iso(),
+                  warehouse_name=None, cluster_name=None, breakdown=None)
+    await series.upsert_stock_daily(db, [{**common, "qty": 3}])
+    await series.upsert_stock_daily(db, [{**common, "qty": 4}])
+    assert await _rows(db, "SELECT count(*), qty FROM stock_daily") == [(1, 4)]
+
+
+@pytest.mark.asyncio
+async def test_coverage_counts_only_the_snapshot(db):
+    """Сверка покрытия обязана считать снимок, а не сумму двух источников."""
+    day = tz.today_msk()
+    common = dict(date_msk=day, warehouse="100", shop_id="main",
+                  fetched_at=tz.now_msk_iso(), warehouse_name=None,
+                  cluster_name=None, breakdown=None)
+    await series.upsert_stock_daily(db, [
+        {**common, "sku": 1, "source": "snapshot", "qty": 3},
+        {**common, "sku": 2, "source": "placement_report", "qty": 9},
+    ])
+    coverage = await stocks.coverage_against_catalogue(db, shop_id="main", day=day)
+    assert coverage["sku со строкой остатка"] == 1, (
+        "в покрытие снимка попал sku, которого снимок не видел"
+    )

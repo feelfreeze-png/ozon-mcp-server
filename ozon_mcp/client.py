@@ -4,7 +4,7 @@ import asyncio
 import math
 import re
 import httpx
-from datetime import datetime, timedelta, timezone
+from datetime import date as _date, datetime, timedelta, timezone
 
 from . import limits, numbers, timezones
 from typing import Any
@@ -1113,6 +1113,38 @@ class OzonSellerClient:
     async def report_info(self, code: str) -> dict:
         """POST /v1/report/info — статус отчёта."""
         return await self._post("/v1/report/info", {"code": code})
+
+    async def report_placement_create(
+        self, date_from: str, date_to: str, *, language: str = "DEFAULT",
+    ) -> dict:
+        """POST /v1/report/placement/by-products/create — отчёт размещения FBO.
+
+        Единственный источник истории остатков: синхронные ручки показывают состояние
+        на сейчас, а этот отчёт отдаёт прошлое — по справочнику не меньше 6,5 месяцев.
+
+        🔴 **Прогоны расходуются безвозвратно: 5 в сутки на кабинет.** Поэтому период
+        сверяется до отправки, а не после отказа: потраченный впустую прогон не
+        возвращается, и следующая попытка будет уже из оставшихся.
+
+        ⚠️ Только FBO. «Кол-во экземпляров» в отчёте — величина **тарификации**, а не
+        остаток, и сопоставлять её со снимком напрямую нельзя.
+        """
+        timezones.require_plain_day(date_from, "date_from")
+        timezones.require_plain_day(date_to, "date_to")
+        span = (_date.fromisoformat(date_to) - _date.fromisoformat(date_from)).days + 1
+        window = limits.limit("placement_report.days")
+        if span < 1:
+            raise ValueError(f"период {date_from}…{date_to} пуст или перевёрнут")
+        if span > window.value:
+            raise ValueError(
+                f"период {span} дней > {window.value}: {window.what}. "
+                f"Происхождение числа — {window.origin} ({window.evidence}). "
+                "Прогон расходуется безвозвратно, поэтому отвергаем до отправки."
+            )
+        return await self._post(
+            "/v1/report/placement/by-products/create",
+            {"date_from": date_from, "date_to": date_to, "language": language},
+        )
 
     async def report_products_create(self, visibility: str = "ALL", language: str = "DEFAULT") -> dict:
         """POST /v1/report/products/create — создать отчёт по товарам."""

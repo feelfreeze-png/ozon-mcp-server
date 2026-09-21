@@ -32,7 +32,8 @@ TABLES = {"ad_daily", "stock_daily", "product", "product_sku", "action_log",
 # продвигаемый двумя кампаниями в один день, схлопнулся бы в одну строку.
 EXPECTED_PRIMARY_KEYS = {
     "ad_daily": ("date_msk", "sku", "campaign_id", "shop_id"),
-    "stock_daily": ("date_msk", "sku", "warehouse", "shop_id"),
+    # 🔴 `source` в ключе: без него бэкфилл ЗАТИРАЕТ снимок, а не лежит рядом.
+    "stock_daily": ("date_msk", "sku", "warehouse", "shop_id", "source"),
     "product": ("product_id", "shop_id"),
     "product_sku": ("sku", "shop_id"),
     "action_log": ("id",),

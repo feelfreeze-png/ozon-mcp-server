@@ -199,6 +199,25 @@ _M2_COLLECTION_RUN = """
     ) STRICT
 """
 
+_M4_STOCK_DAILY_REBUILT = """
+    CREATE TABLE stock_daily_v4 (
+        date_msk       TEXT    NOT NULL,
+        sku            INTEGER NOT NULL,
+        warehouse      TEXT    NOT NULL,
+        shop_id        TEXT    NOT NULL,
+        source         TEXT    NOT NULL,          -- snapshot | placement_report
+        qty            INTEGER,
+        fetched_at     TEXT    NOT NULL,
+        warehouse_name TEXT,
+        cluster_name   TEXT,
+        breakdown      TEXT,
+        PRIMARY KEY (date_msk, sku, warehouse, shop_id, source),
+        CHECK (date_msk GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]'),
+        CHECK (source IN ('snapshot', 'placement_report')),
+        CHECK (fetched_at GLOB '*[+-][0-9][0-9]:[0-9][0-9]' OR fetched_at GLOB '*Z')
+    ) STRICT
+"""
+
 MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
     (
         1,
@@ -232,6 +251,31 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
             # (valid, transit, defect, returns…), и какой из них понадобится завтра,
             # сегодня неизвестно. Ряд невосстановим, поэтому дешевле сохранить всё.
             "ALTER TABLE stock_daily ADD COLUMN breakdown TEXT",
+        ),
+    ),
+    (
+        4,
+        (
+            # 🔴 `source` переезжает В ПЕРВИЧНЫЙ КЛЮЧ. Без него строка бэкфилла с тем же
+            # `(дата, sku, склад, магазин)` не «смешивалась» со снимком, как опасается
+            # ТЗ, а молча СЪЕДАЛА его: `INSERT OR REPLACE` оставлял одну строку, и
+            # измеренный остаток подменялся величиной тарификации. Проверено прогоном на
+            # той же DDL: count(*)=1, выживал placement_report.
+            #
+            # Приёмка D4 — «доля SKU с совпадением qty за день, где есть и снимок, и
+            # бэкфилл» — на прежнем ключе была невычислима в принципе: сравнивать было
+            # не с чем уже в момент записи, а прогон при этом закрывался как успешный.
+            #
+            # Первичный ключ в STRICT-таблице через ALTER не меняется, поэтому таблица
+            # пересобирается. Данные переносятся целиком: ряд невосстановим.
+            _M4_STOCK_DAILY_REBUILT,
+            "INSERT INTO stock_daily_v4 (date_msk, sku, warehouse, shop_id, source, "
+            "qty, fetched_at, warehouse_name, cluster_name, breakdown) "
+            "SELECT date_msk, sku, warehouse, shop_id, source, qty, fetched_at, "
+            "warehouse_name, cluster_name, breakdown FROM stock_daily",
+            "DROP TABLE stock_daily",
+            "ALTER TABLE stock_daily_v4 RENAME TO stock_daily",
+            "CREATE INDEX stock_daily_by_shop_day ON stock_daily (shop_id, date_msk)",
         ),
     ),
 ]

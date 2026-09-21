@@ -20,7 +20,9 @@ from ozon_mcp.server import (
     get_mcp_app, reset_all_clients, reset_shop, set_stats_callback,
     get_seller_for_shop, get_perf_for_shop,
 )
-from ozon_mcp import collector, series, settings as cfg, timezones
+from ozon_mcp import (
+    catalogue, collector, series, settings as cfg, stocks, timezones,
+)
 from ozon_mcp import stats
 from ozon_mcp import diagnostics as diag
 from ozon_mcp import tenancy
@@ -131,6 +133,33 @@ async def _collect_once() -> None:
             # Гасим здесь только ради соседних магазинов: отказ уже записан в
             # collection_run как failed и напечатан. Молчаливого пропуска нет.
             print(f"СБОР ПРОВАЛЕН {shop_id} за {day}: {type(exc).__name__}: {exc}",
+                  flush=True)
+
+        # Товары и остатки. Порядок значим: таблица товаров даёт перечень SKU, по
+        # которому снимается остаток. Снимок берётся за СЕГОДНЯ, а не за вчера:
+        # синхронные ручки показывают состояние на сейчас, прошлого у них нет.
+        try:
+            seller = get_seller_for_shop(shop_id)
+            table = await catalogue.rebuild(seller, db, shop_id=shop_id)
+            print(f"товары {shop_id}: карточек {table.products} "
+                  f"(активных {table.active}, архивных {table.archived}), "
+                  f"строк sku {table.skus}", flush=True)
+            for key in ("без второго источника, всего", "незнакомые схемы"):
+                if key in table.detail:
+                    print(f"  ⚠️ {key}: {table.detail[key]}", flush=True)
+
+            async with db.execute(
+                "SELECT DISTINCT sku FROM product_sku WHERE shop_id = ?", (shop_id,)
+            ) as cur:
+                skus = [row[0] for row in await cur.fetchall()]
+            snapshot = await stocks.snapshot_day(seller, db, shop_id=shop_id, skus=skus)
+            print(f"остатки {shop_id} за {snapshot.day_msk}: строк "
+                  f"{snapshot.rows_written}, sku со строками {snapshot.skus_with_rows} "
+                  f"из {snapshot.requested}, складов {snapshot.warehouses}", flush=True)
+            if not snapshot.ok:
+                print(f"  СНИМОК НЕПОЛОН: {snapshot.error}", flush=True)
+        except Exception as exc:
+            print(f"ОСТАТКИ ПРОВАЛЕНЫ {shop_id}: {type(exc).__name__}: {exc}",
                   flush=True)
 
 
