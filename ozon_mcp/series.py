@@ -221,6 +221,19 @@ MIGRATIONS: list[tuple[int, tuple[str, ...]]] = [
             "CREATE INDEX collection_run_by_day ON collection_run (shop_id, day_msk)",
         ),
     ),
+    (
+        3,
+        (
+            # Ключом склада становится его идентификатор: имена Ozon меняет, и
+            # переименование развалило бы ряд на два склада-призрака.
+            "ALTER TABLE stock_daily ADD COLUMN warehouse_name TEXT",
+            "ALTER TABLE stock_daily ADD COLUMN cluster_name TEXT",
+            # Полный разбор остатка строкой JSON. Ozon отдаёт полтора десятка счётчиков
+            # (valid, transit, defect, returns…), и какой из них понадобится завтра,
+            # сегодня неизвестно. Ряд невосстановим, поэтому дешевле сохранить всё.
+            "ALTER TABLE stock_daily ADD COLUMN breakdown TEXT",
+        ),
+    ),
 ]
 
 
@@ -482,6 +495,37 @@ async def upsert_ad_daily(db: aiosqlite.Connection, rows: list[dict]) -> int:
     await db.execute("BEGIN IMMEDIATE")
     try:
         await db.executemany(_AD_DAILY_UPSERT, payload)
+        await db.execute("COMMIT")
+    except BaseException:
+        with contextlib.suppress(Exception):
+            await db.execute("ROLLBACK")
+        raise
+    return len(payload)
+
+
+STOCK_DAILY_COLUMNS = (
+    "date_msk", "sku", "warehouse", "shop_id", "qty", "source", "fetched_at",
+    "warehouse_name", "cluster_name", "breakdown",
+)
+
+_STOCK_DAILY_UPSERT = (
+    "INSERT OR REPLACE INTO stock_daily (" + ", ".join(STOCK_DAILY_COLUMNS) + ") "
+    "VALUES (" + ", ".join("?" * len(STOCK_DAILY_COLUMNS)) + ")"
+)
+
+
+async def upsert_stock_daily(db: aiosqlite.Connection, rows: list[dict]) -> int:
+    """Записать срез остатков. Повтор за тот же день перезаписывает.
+
+    Ключ `(date_msk, sku, warehouse, shop_id)`: один SKU лежит на многих складах, и
+    складывать их в одну строку значит потерять ровно то, ради чего разрез и нужен.
+    """
+    payload = [tuple(row.get(column) for column in STOCK_DAILY_COLUMNS) for row in rows]
+    if not payload:
+        return 0
+    await db.execute("BEGIN IMMEDIATE")
+    try:
+        await db.executemany(_STOCK_DAILY_UPSERT, payload)
         await db.execute("COMMIT")
     except BaseException:
         with contextlib.suppress(Exception):

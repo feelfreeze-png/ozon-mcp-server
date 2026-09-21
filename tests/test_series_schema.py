@@ -62,6 +62,9 @@ STOCK_INSERT = (
     "INSERT INTO stock_daily (date_msk, sku, warehouse, shop_id, qty, source, fetched_at) "
     "VALUES (?, ?, ?, ?, ?, ?, ?)"
 )
+
+#: Колонки, добавленные миграцией 3. Разрез по складу без имени склада нечитаем.
+STOCK_EXTRA_COLUMNS = ("warehouse_name", "cluster_name", "breakdown")
 STOCK_ROW = ("2026-09-19", 123456, "Хоругвино", "shop1", 7, "snapshot", "2026-09-20T03:15:00+03:00")
 
 

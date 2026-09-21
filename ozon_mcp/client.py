@@ -57,8 +57,10 @@ class OzonSellerClient:
             return r.json() if r.content else {}
         return {}
 
-    async def _post(self, path: str, body: dict | None = None) -> dict:
-        return await self._send("POST", path, json_body=body or {})
+    async def _post(self, path: str, body: dict | None = None, *,
+                    max_retries: int = 3) -> dict:
+        return await self._send("POST", path, json_body=body or {},
+                                max_retries=max_retries)
 
     async def _get(self, path: str, params: dict | None = None) -> dict:
         return await self._send("GET", path, params=params)
@@ -536,9 +538,26 @@ class OzonSellerClient:
     # /v1/analytics/stock_on_warehouses УДАЛЁН из Ozon API (404).
     # Замены: /v1/analytics/stocks (по SKU) и /v1/analytics/turnover/stocks.
 
-    async def analytics_stocks(self, skus: list[int]) -> dict:
-        """POST /v1/analytics/stocks — аналитика по остаткам (1-100 SKU за запрос)."""
-        return await self._post("/v1/analytics/stocks", {"skus": [str(s) for s in skus]})
+    async def analytics_stocks(self, skus: list[int], *, max_retries: int = 6) -> dict:
+        """POST /v1/analytics/stocks — остатки в разрезе `sku × склад`.
+
+        Единственная из четырёх ручек остатков, дающая нужный схеме разрез. Замерено
+        21.09.2026: `/v1/analytics/turnover/stocks` отдаёт `current_stock` одним числом
+        без склада; `/v4/product/info/stocks` ответил `400 Bad Request` и склада тоже не
+        даёт; `/v2/product/info/stocks-by-warehouse/fbs` — только FBS.
+
+        ⚠️ **Ручка режет.** Замерено: первая же порция из 100 SKU получила `429` и не
+        прошла даже после трёх повторов с паузами 1, 2 и 4 секунды. Поэтому повторов
+        здесь больше, чем у соседей.
+
+        ⚠️ **Строка приходит не на каждый SKU.** Замерено: на 300 запрошенных вернулось
+        39 разных. Отсутствие строки означает «остатка нет нигде», и это **не то же
+        самое**, что «не спрашивали» — различать обязан вызывающий.
+        """
+        limits.check("analytics_stocks.skus", skus)
+        return await self._post(
+            "/v1/analytics/stocks", {"skus": [str(s) for s in skus]},
+            max_retries=max_retries)
 
     async def placement_zone_info(self, skus: list[int]) -> dict:
         """POST /v1/product/placement-zone/info — зоны размещения товаров по SKU.
