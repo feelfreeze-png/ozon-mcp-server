@@ -322,3 +322,37 @@ def test_all_names_found_says_nothing():
     built = report.build(period=PERIOD, coverage=FULL, ad_rows=rows,
                          kinds=report.campaign_kinds([CPC]), names=NAMES)
     assert not [note for note in built.notes if "Названия не нашлись" in note]
+
+
+# ── Счётчики аномалий ────────────────────────────────────────────────────────
+
+
+def test_anomaly_counts_come_ready_made():
+    """🔴 Сторож против ошибки, случившейся живьём 21.09.2026.
+
+    Отчёт отдал 111 товаров с расходом и без заказов, а в сводку ушло 113: считать
+    длину списка пришлось тому, кто пишет текст. Число обязано быть в ответе.
+    """
+    rows = [_row(sku, 42708950, 10.0) for sku in range(1, 112)]
+    built = report.build(period=PERIOD, coverage=FULL, ad_rows=rows,
+                         kinds=report.campaign_kinds([CPC]), stock={1: 5})
+    counts = built.as_dict()["аномалий, штук"]
+    assert counts["расход без заказов"] == 111
+    assert counts["расход без заказов"] == len(built.anomalies["расход без заказов"])
+
+
+def test_an_unchecked_anomaly_counts_as_none_not_zero():
+    """Ноль сказал бы «проверили, чисто». Проверки не было."""
+    rows = [_row(1, 42708950, 10.0, orders=2, sales=100.0)]
+    built = report.build(period=PERIOD, coverage=FULL, ad_rows=rows,
+                         kinds=report.campaign_kinds([CPC]), stock=None)
+    counts = built.as_dict()["аномалий, штук"]
+    assert counts["заказы без остатка"] is None
+    assert counts["расход без заказов"] == 0, "эта проверка выполнялась — тут честный ноль"
+
+
+def test_counts_cover_every_anomaly_that_has_a_list():
+    built = report.build(period=PERIOD, coverage=FULL, ad_rows=[], kinds={}, stock={})
+    counts = built.as_dict()["аномалий, штук"]
+    assert set(counts) == {"расход без заказов", "заказы без остатка", "обрыв ряда"}
+    assert all(value == 0 for value in counts.values())
