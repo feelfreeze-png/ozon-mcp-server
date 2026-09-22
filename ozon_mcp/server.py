@@ -1403,10 +1403,17 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
         # ДРР не считается и отчёт об этом говорит.
         kinds = None
         kinds_error = None
+        kinds_missing: list[int] = []
         try:
             perf = _get_perf(shop_id)
-            listing = await perf.campaigns_all(page_size=100)
+            # Спрашиваем ТОЛЬКО кампании этого дня, а не весь кабинет. Замер
+            # 22.09.2026: полный обход 1708 кампаний — 158,6 с из 165 с отчёта, тогда
+            # как 52 кампании дня по `campaignIds` берутся за 0,4 с. Инструмент,
+            # который идёт три минуты, живёт на милости любого таймаута перед ним.
+            day_campaigns = [row["campaign_id"] for row in rows if row.get("campaign_id")]
+            listing = await perf.campaigns_by_ids(day_campaigns)
             kinds = report.campaign_kinds(listing["list"])
+            kinds_missing = listing["missing"]
         except Exception as exc:
             # Гасим намеренно и ГРОМКО: без классификации отчёт собирается, но без
             # ДРР — и причина уезжает в сам отчёт. Молчаливое `pass` здесь дало бы
@@ -1435,6 +1442,14 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
             built.notes.append(
                 f"Классификацию кампаний получить не удалось ({kinds_error}). "
                 "Поэтому ДРР не посчитан — это отказ, а не отсутствие расхода.")
+        if kinds_missing:
+            built.notes.append(
+                f"Ozon не вернул {len(kinds_missing)} кампаний из тех, что есть в ряду "
+                f"({', '.join(str(c) for c in kinds_missing[:10])}"
+                f"{'…' if len(kinds_missing) > 10 else ''}). Их тип неизвестен, поэтому "
+                "их расход показан отдельной строкой «неклассифицированный» и в ДРР не "
+                "входит. Обычная причина — кампанию удалили после того, как она "
+                "потратила деньги.")
         return _json(built.as_dict())
 
     if name in ("ozon_ad_series", "ozon_stock_series"):

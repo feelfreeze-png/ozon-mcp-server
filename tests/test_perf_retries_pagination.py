@@ -269,3 +269,109 @@ async def test_single_page_call_still_honours_page_arguments():
     await client.campaigns_list(page=3, page_size=25)
     assert transport.requests[0][2]["page"] == 3
     assert transport.requests[0][2]["pageSize"] == 25
+
+
+# ── Кампании по списку id: отчёту не нужен весь кабинет ──────────────────────
+
+
+class ByIdsSeller:
+    """Кабинет, отвечающий ровно на спрошенные идентификаторы."""
+
+    def __init__(self, known: set[int] | None = None):
+        self.known = known
+        self.calls: list[list[int]] = []
+
+    async def campaigns_list(self, campaign_ids=None, page_size=100, **kwargs):
+        ids = [int(c) for c in (campaign_ids or [])]
+        self.calls.append(ids)
+        found = [i for i in ids if self.known is None or i in self.known]
+        return {"list": [{"id": str(i), "advObjectType": "SKU"} for i in found],
+                "total": len(found)}
+
+
+def _client_with(seller):
+    from ozon_mcp.client import OzonPerformanceClient
+
+    client = OzonPerformanceClient.__new__(OzonPerformanceClient)
+    client.campaigns_list = seller.campaigns_list
+    return client
+
+
+@pytest.mark.asyncio
+async def test_only_the_named_campaigns_are_asked_for():
+    """🔴 Замер 22.09.2026: полный обход — 158,6 с, нужные 52 кампании — 0,4 с."""
+    seller = ByIdsSeller()
+    got = await _client_with(seller).campaigns_by_ids([42708950, 41668952], pause_s=0)
+
+    assert seller.calls == [[41668952, 42708950]], "спрошено не то, что просили"
+    assert got["asked"] == 2 and got["missing"] == []
+    assert {c["id"] for c in got["list"]} == {"41668952", "42708950"}
+
+
+@pytest.mark.asyncio
+async def test_duplicates_are_asked_once():
+    seller = ByIdsSeller()
+    await _client_with(seller).campaigns_by_ids([7, 7, 7, 9], pause_s=0)
+    assert seller.calls == [[7, 9]]
+
+
+@pytest.mark.asyncio
+async def test_more_than_a_page_is_split_into_chunks():
+    """Порция — измеренный лимит страницы, а не круглое число из головы."""
+    seller = ByIdsSeller()
+    ids = list(range(1, 251))
+    got = await _client_with(seller).campaigns_by_ids(ids, pause_s=0)
+
+    assert got["requests"] == 3, "250 идентификаторов при лимите 100 — это три запроса"
+    assert [len(c) for c in seller.calls] == [100, 100, 50]
+    assert len(got["list"]) == 250
+
+
+@pytest.mark.asyncio
+async def test_a_campaign_ozon_did_not_return_is_named():
+    """Пропавшая кампания обязана быть названа: её расход уйдёт в «неизвестные»."""
+    seller = ByIdsSeller(known={1, 3})
+    got = await _client_with(seller).campaigns_by_ids([1, 2, 3], pause_s=0)
+
+    assert got["missing"] == [2]
+    assert got["asked"] == 3
+
+
+@pytest.mark.asyncio
+async def test_an_empty_request_asks_ozon_nothing():
+    seller = ByIdsSeller()
+    got = await _client_with(seller).campaigns_by_ids([], pause_s=0)
+    assert seller.calls == [] and got["requests"] == 0
+
+
+@pytest.mark.asyncio
+async def test_a_second_page_of_results_is_refused_loudly():
+    """Если фильтр перестанет умещаться в страницу, молча брать первую нельзя."""
+    class Truncating(ByIdsSeller):
+        async def campaigns_list(self, campaign_ids=None, page_size=100, **kwargs):
+            self.calls.append(list(campaign_ids or []))
+            return {"list": [{"id": "1", "advObjectType": "SKU"}], "total": 42}
+
+    with pytest.raises(ValueError, match="не уместился на одну страницу"):
+        await _client_with(Truncating()).campaigns_by_ids([1, 2], pause_s=0)
+
+
+@pytest.mark.asyncio
+async def test_the_pause_is_kept_between_chunks_but_not_before_the_first():
+    """Пауза 9 с замерена: второй запрос подряд даёт 429. Перед первым она — трата."""
+    import asyncio as _asyncio
+
+    seller = ByIdsSeller()
+    slept: list[float] = []
+
+    async def _record(seconds):
+        slept.append(seconds)
+
+    real_sleep = _asyncio.sleep
+    _asyncio.sleep = _record
+    try:
+        await _client_with(seller).campaigns_by_ids(list(range(1, 151)), pause_s=9.0)
+    finally:
+        _asyncio.sleep = real_sleep
+
+    assert slept == [9.0], "пауза нужна между порциями, а не перед первой"

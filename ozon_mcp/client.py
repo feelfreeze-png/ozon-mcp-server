@@ -1503,6 +1503,60 @@ class OzonPerformanceClient:
             )
         return {"list": collected, "total": total, "pages": pages, "pageSize": page_size}
 
+    async def campaigns_by_ids(
+        self, campaign_ids: list[int], *, pause_s: float | None = None,
+    ) -> dict:
+        """Только названные кампании — без обхода всего кабинета.
+
+        🔴 **Замер 22.09.2026, ради которого это и написано.** Отчёт за день звал
+        `campaigns_all` ради одной величины — типа кампании. Обход 1708 кампаний идёт
+        **158,6 с из 165 с всего отчёта**: сами запросы быстрые, время съедает
+        обязательная пауза 9 с между страницами (второй запрос подряд даёт 429). При
+        этом в дне участвовало **52** кампании. Запрос тех же 52 по `campaignIds` занял
+        **0,4 с** и вернул ровно их: `total` 52, лишних ноль.
+
+        Цена прежнего решения была не только во времени. 165-секундный инструмент живёт
+        на милости любого таймаута перед ним: под `claude-cli` он успевал, под моделью
+        с более коротким MCP-таймаутом отчёт не собрался вовсе — пять попыток, ни одной
+        удачной, и это выглядело как отказ Ozon.
+
+        Полнота проверяется, а не предполагается: `missing` называет кампании, которых
+        Ozon не вернул. Их расход уйдёт в «неклассифицированный» с отдельным замечанием,
+        а не растворится в управляемом.
+        """
+        wanted = sorted({int(c) for c in campaign_ids if c})
+        if not wanted:
+            return {"list": [], "asked": 0, "missing": [], "requests": 0}
+
+        pause = self.CAMPAIGNS_PAGE_PAUSE_S if pause_s is None else pause_s
+        page_size = limits.limit("campaigns.page_size").value
+        collected: list[dict] = []
+        requests = 0
+        for index, batch in enumerate(limits.chunks("campaigns.page_size", wanted)):
+            if index and pause:
+                await asyncio.sleep(pause)
+            payload = await self.campaigns_list(campaign_ids=batch, page_size=page_size)
+            requests += 1
+            chunk = payload.get("list") or []
+            collected.extend(chunk)
+            reported = numbers.parse_int(payload.get("total"), field="total")
+            if reported is not None and reported > len(chunk):
+                raise ValueError(
+                    f"фильтр по campaignIds вернул {len(chunk)} записей при total="
+                    f"{reported}: ответ не уместился на одну страницу, хотя спрошено "
+                    f"{len(batch)} идентификаторов при pageSize={page_size}. Замер "
+                    "22.09.2026 давал ровно спрошенное — значит поведение изменилось, "
+                    "и молча брать первую страницу нельзя."
+                )
+
+        got = {int(c["id"]) for c in collected if c.get("id")}
+        return {
+            "list": collected,
+            "asked": len(wanted),
+            "missing": [c for c in wanted if c not in got],
+            "requests": requests,
+        }
+
     async def _campaigns_page(self, params: dict[str, Any]) -> dict:
         return await self._get("/api/client/campaign", params)
 
