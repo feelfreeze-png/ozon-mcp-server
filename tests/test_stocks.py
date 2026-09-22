@@ -332,3 +332,38 @@ async def test_coverage_counts_only_the_snapshot(db):
     assert coverage["sku со строкой остатка"] == 1, (
         "в покрытие снимка попал sku, которого снимок не видел"
     )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_chunk_carries_its_reason_into_the_journal(db):
+    """🔴 Найдено живым прогоном 22.09.2026.
+
+    Ночной снимок отдал `порций не снялось: 1` — и ни слова о том, почему. Причина
+    вычислялась и терялась между вычислением и записью: в журнале прогонов оставался
+    только счётчик, а разбирать приходилось по логу контейнера, который живёт до
+    перезапуска. Факт отказа без его причины — половина отказа.
+    """
+    class Flaky:
+        def __init__(self):
+            self.calls = 0
+
+        async def analytics_stocks(self, skus):
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("Ozon ответил 500")
+            return {"items": [{"sku": skus[0], "warehouse_id": 1,
+                               "warehouse_name": "Склад", "cluster_name": "Кластер",
+                               "available_stock_count": 7}]}
+
+    skus = list(range(1, 251))
+    result = await stocks.snapshot_day(Flaky(), db, shop_id="main", skus=skus, pause_s=0)
+
+    assert not result.ok
+    assert "порций не снялось: 1" in result.error
+    assert "Ozon ответил 500" in result.error, "причина не доехала до журнала"
+
+    async with db.execute(
+        "SELECT status, error FROM collection_run WHERE source = 'snapshot'") as cur:
+        status, error = await cur.fetchone()
+    assert status == "failed"
+    assert "Ozon ответил 500" in error, "причина не доехала до collection_run"

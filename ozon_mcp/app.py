@@ -158,6 +158,12 @@ async def _collect_once() -> None:
                   f"из {snapshot.requested}, складов {snapshot.warehouses}", flush=True)
             if not snapshot.ok:
                 print(f"  СНИМОК НЕПОЛОН: {snapshot.error}", flush=True)
+                # ⚠️ Причина отказа СЧИТАЕТСЯ в `stocks.snapshot_day`, но до 22.09.2026
+                # печаталось только «порций не снялось: 1» — без единого слова о том,
+                # почему. Разбирать неполный снимок приходилось наугад: сам отказ
+                # виден, его причина потеряна между вычислением и логом.
+                for reason in snapshot.detail.get("неудавшиеся порции") or []:
+                    print(f"    порция не снялась: {reason}", flush=True)
         except Exception as exc:
             print(f"ОСТАТКИ ПРОВАЛЕНЫ {shop_id}: {type(exc).__name__}: {exc}",
                   flush=True)
