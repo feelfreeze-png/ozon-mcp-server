@@ -106,6 +106,30 @@ def get_shop_keys(data_dir: Path, shop_id: str) -> dict[str, str]:
     return shops[shop_id]
 
 
+#: Какие ключи нужны каждой половине кабинета.
+SELLER_KEYS = ("ozon_client_id", "ozon_api_key")
+PERF_KEYS = ("ozon_perf_client_id", "ozon_perf_client_secret")
+
+
+def shop_capabilities(data_dir: Path, shop_id: str) -> dict[str, bool]:
+    """Что этот магазин вообще умеет: `{"seller": bool, "performance": bool}`.
+
+    🔴 **Нужно, чтобы отличать «не настроено» от «сломалось».** Кабинет, заведённый
+    только с ключами Performance, каждую ночь печатал бы «ОСТАТКИ ПРОВАЛЕНЫ» — и
+    настоящий отказ остатков на полностью настроенном магазине стал бы неотличим от
+    ожидаемого сообщения у соседнего. Постоянная ожидаемая тревога приучает не читать
+    тревоги вовсе.
+
+    Ключи Seller и Performance выдаются в разных разделах кабинета Ozon и приходят
+    порознь: половина кабинета — нормальное промежуточное состояние, а не поломка.
+    """
+    keys = get_shop_keys(data_dir, shop_id)
+    return {
+        "seller": all(keys.get(name) for name in SELLER_KEYS),
+        "performance": all(keys.get(name) for name in PERF_KEYS),
+    }
+
+
 def get_shop_list(data_dir: Path) -> list[dict]:
     """Список магазинов для отображения (без ключей)."""
     shops = load_shops(data_dir)

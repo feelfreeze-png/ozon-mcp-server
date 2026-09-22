@@ -78,3 +78,63 @@ def test_migration_from_old_settings(tmp_path):
     loaded = load_shops(tmp_path)
     assert "default" in loaded
     assert loaded["default"]["ozon_client_id"] == "old_id"
+
+
+# ── Половина кабинета — нормальное состояние, а не поломка ───────────────────
+
+
+def _write_shop(tmp_path, shop_id, **keys):
+    from ozon_mcp import settings as cfg
+
+    shops = cfg.load_shops(tmp_path)
+    shops[shop_id] = {"name": shop_id, **keys}
+    cfg.save_shops(tmp_path, shops)
+
+
+def test_a_performance_only_shop_is_reported_as_such(tmp_path):
+    """🔴 «Не настроено» и «сломалось» обязаны различаться.
+
+    Кабинет с одними ключами Performance каждую ночь печатал бы «ОСТАТКИ
+    ПРОВАЛЕНЫ», и настоящий отказ остатков на соседнем, полностью настроенном
+    магазине стал бы неотличим от ожидаемого сообщения. Постоянная ожидаемая
+    тревога приучает не читать тревоги вовсе.
+    """
+    from ozon_mcp import settings as cfg
+
+    _write_shop(tmp_path, "perf_only",
+                ozon_perf_client_id="id", ozon_perf_client_secret="secret")
+    assert cfg.shop_capabilities(tmp_path, "perf_only") == {
+        "seller": False, "performance": True}
+
+
+def test_a_seller_only_shop_is_reported_as_such(tmp_path):
+    from ozon_mcp import settings as cfg
+
+    _write_shop(tmp_path, "seller_only", ozon_client_id="id", ozon_api_key="key")
+    assert cfg.shop_capabilities(tmp_path, "seller_only") == {
+        "seller": True, "performance": False}
+
+
+def test_a_full_shop_can_do_both(tmp_path):
+    from ozon_mcp import settings as cfg
+
+    _write_shop(tmp_path, "full", ozon_client_id="a", ozon_api_key="b",
+                ozon_perf_client_id="c", ozon_perf_client_secret="d")
+    assert cfg.shop_capabilities(tmp_path, "full") == {
+        "seller": True, "performance": True}
+
+
+def test_half_a_pair_is_not_a_capability(tmp_path):
+    """Один ключ из двух — это не «умеет наполовину», это не умеет."""
+    from ozon_mcp import settings as cfg
+
+    _write_shop(tmp_path, "halfpair", ozon_perf_client_id="c")
+    assert cfg.shop_capabilities(tmp_path, "halfpair")["performance"] is False
+
+
+def test_an_empty_string_is_not_a_key(tmp_path):
+    from ozon_mcp import settings as cfg
+
+    _write_shop(tmp_path, "blank", ozon_client_id="a", ozon_api_key="",
+                ozon_perf_client_id="c", ozon_perf_client_secret="d")
+    assert cfg.shop_capabilities(tmp_path, "blank")["seller"] is False

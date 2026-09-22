@@ -105,6 +105,10 @@ def _seconds_until_next_run() -> float:
     return (target - now).total_seconds()
 
 
+class _SkipShop(Exception):
+    """Магазин пропущен по настройке, а не из-за отказа."""
+
+
 async def _collect_once() -> None:
     """Один проход сбора по всем магазинам.
 
@@ -120,7 +124,15 @@ async def _collect_once() -> None:
     day = timezones.yesterday_msk()
     for shop in cfg.get_shop_list(DATA_DIR):
         shop_id = shop["id"]
+        can = cfg.shop_capabilities(DATA_DIR, shop_id)
+        if not can["performance"]:
+            # Не «провалился», а «не настроен». Разница в том, надо ли идти чинить.
+            print(f"магазин {shop_id}: ключей Performance нет — рекламная статистика "
+                  f"НЕ собирается. Это настройка, а не отказ; но сутки, прошедшие без "
+                  f"ключей, восстановить будет нечем.", flush=True)
         try:
+            if not can["performance"]:
+                raise _SkipShop
             perf = get_perf_for_shop(shop_id)
             result = await collector.collect_day(perf, db, shop_id=shop_id, day=day)
             print(f"сбор {shop_id} за {day}: строк {result.rows_written}, "
@@ -129,6 +141,8 @@ async def _collect_once() -> None:
             if result.unknown_fields:
                 print(f"  ⚠️ Ozon прислал незнакомые поля: "
                       f"{sorted(result.unknown_fields)}", flush=True)
+        except _SkipShop:
+            pass
         except Exception as exc:
             # Гасим здесь только ради соседних магазинов: отказ уже записан в
             # collection_run как failed и напечатан. Молчаливого пропуска нет.
@@ -138,6 +152,13 @@ async def _collect_once() -> None:
         # Товары и остатки. Порядок значим: таблица товаров даёт перечень SKU, по
         # которому снимается остаток. Снимок берётся за СЕГОДНЯ, а не за вчера:
         # синхронные ручки показывают состояние на сейчас, прошлого у них нет.
+        if not can["seller"]:
+            print(f"магазин {shop_id}: ключей Seller нет — каталог и остатки пропущены. "
+                  f"Это настройка, а не отказ. Без них не будет названий товаров, "
+                  f"проверки «заказы без остатка» и доли рекламных заказов; остатки "
+                  f"бэкфиллятся позже, рекламная статистика — нет.", flush=True)
+            continue
+
         try:
             seller = get_seller_for_shop(shop_id)
             table = await catalogue.rebuild(seller, db, shop_id=shop_id)
