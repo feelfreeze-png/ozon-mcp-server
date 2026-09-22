@@ -38,6 +38,12 @@ class FakePerf:
         return [dict(row) for row in self.rows_by_day.get(day, [])]
 
 
+def _shop(shop_id, *, seller=True, performance=True):
+    """Магазин так, как его отдаёт `cfg.get_shop_list` — вместе с тем, что он умеет."""
+    return {"id": shop_id, "name": shop_id,
+            "can": {"seller": seller, "performance": performance}}
+
+
 def _row(sku, campaign, day, expense=1.5, **extra):
     base = {"sku": sku, "campaign_id": campaign, "date_msk": day,
             "expense": expense, "views": 100, "clicks": 5, "to_cart": 2,
@@ -312,7 +318,7 @@ async def test_one_shop_failing_does_not_stop_the_others(monkeypatch, capsys, db
     monkeypatch.setattr(series, "is_enabled", lambda: True)
     monkeypatch.setattr(series, "connection", lambda: db)
     monkeypatch.setattr(app.cfg, "get_shop_list",
-                        lambda _d: [{"id": "плохой"}, {"id": "хороший"}])
+                        lambda _d: [_shop("плохой"), _shop("хороший")])
     monkeypatch.setattr(app, "get_perf_for_shop",
                         lambda shop_id: bad if shop_id == "плохой" else good)
 

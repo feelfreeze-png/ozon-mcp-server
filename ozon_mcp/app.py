@@ -124,7 +124,7 @@ async def _collect_once() -> None:
     day = timezones.yesterday_msk()
     for shop in cfg.get_shop_list(DATA_DIR):
         shop_id = shop["id"]
-        can = cfg.shop_capabilities(DATA_DIR, shop_id)
+        can = shop["can"]
         if not can["performance"]:
             # Не «провалился», а «не настроен». Разница в том, надо ли идти чинить.
             print(f"магазин {shop_id}: ключей Performance нет — рекламная статистика "

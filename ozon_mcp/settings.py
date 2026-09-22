@@ -131,9 +131,21 @@ def shop_capabilities(data_dir: Path, shop_id: str) -> dict[str, bool]:
 
 
 def get_shop_list(data_dir: Path) -> list[dict]:
-    """Список магазинов для отображения (без ключей)."""
+    """Список магазинов для отображения (без ключей), с тем, что каждый умеет.
+
+    `can` кладётся сюда, а не спрашивается отдельно по каждому магазину: второй
+    поход в хранилище означал бы, что список и возможности читаются в разные моменты
+    и могут разойтись, а расхождение выглядело бы как «магазин не найден».
+    """
     shops = load_shops(data_dir)
-    return [{"id": sid, "name": s.get("name", sid)} for sid, s in shops.items()]
+    return [{
+        "id": sid,
+        "name": s.get("name", sid),
+        "can": {
+            "seller": all(s.get(name) for name in SELLER_KEYS),
+            "performance": all(s.get(name) for name in PERF_KEYS),
+        },
+    } for sid, s in shops.items()]
 
 
 def get_masked_shop(shop: dict) -> dict:
