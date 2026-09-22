@@ -163,3 +163,126 @@ async def test_a_failed_day_is_printed_loudly(monkeypatch, capsys):
     with pytest.raises(asyncio.CancelledError):
         await app_module._collect_loop()
     assert app_module._collect_stopped.startswith("RuntimeError")
+
+
+# ── Форма входа ──────────────────────────────────────────────────────────────
+
+#: Латиница: cookie по стандарту не несёт других символов (см. сторож ниже).
+ADMIN = "s3cret-token"
+
+
+@pytest.fixture
+def guarded(tmp_path, monkeypatch):
+    """Сервер с включённой админской охраной — так он и стоит на проде."""
+    import ozon_mcp.app as app_module
+    import ozon_mcp.server as server_module
+
+    app_module.DATA_DIR = tmp_path
+    server_module.DATA_DIR = tmp_path
+    monkeypatch.setattr(app_module, "ADMIN_TOKEN", ADMIN)
+    from ozon_mcp.app import fastapi_app
+    with TestClient(fastapi_app, follow_redirects=False) as c:
+        yield c
+
+
+def test_a_browser_without_a_token_is_sent_to_the_form(guarded):
+    """🔴 Голый 401 не говорит, ЧТО делать, и выглядит поломкой сервера.
+
+    Ровно это и случилось живьём 22.09.2026: страница `/shops` отдала слово
+    «Unauthorized», и человек не мог понять, сломан сервер или нужен вход.
+    """
+    r = guarded.get("/shops", headers={"accept": "text/html"})
+    assert r.status_code == 303
+    assert r.headers["location"] == "/login"
+
+
+def test_a_script_without_a_token_still_gets_401(guarded):
+    """curl и скрипты не должны разбирать HTML, чтобы понять, что их не пустили."""
+    r = guarded.get("/api/stats")
+    assert r.status_code == 401
+    assert r.text == "Unauthorized"
+
+
+def test_the_form_itself_is_reachable_without_a_token(guarded):
+    r = guarded.get("/login")
+    assert r.status_code == 200 and "Админский токен" in r.text
+
+
+def test_a_correct_token_sets_a_cookie_and_lets_in(guarded):
+    r = guarded.post("/login", data={"token": ADMIN})
+    assert r.status_code == 303 and r.headers["location"] == "/"
+
+    cookie = r.headers["set-cookie"]
+    assert "HttpOnly" in cookie, "скрипт страницы не должен читать вход"
+    assert "samesite=strict" in cookie.lower(), "чужой сайт не должен слать нашу cookie"
+
+    from ozon_mcp.app import ADMIN_COOKIE
+
+    guarded.cookies.set(ADMIN_COOKIE, ADMIN)
+    assert guarded.get("/shops", headers={"accept": "text/html"}).status_code == 200
+
+
+@pytest.mark.parametrize("bad", ["", "  ", "не тот", ADMIN[:-1], ADMIN + "x"])
+def test_a_wrong_token_is_refused_the_same_way(guarded, bad):
+    """Одна ошибка на все случаи: разные тексты подсказывали бы подбирающему."""
+    r = guarded.post("/login", data={"token": bad})
+    assert r.status_code == 401
+    assert "Неверный токен" in r.text
+    assert "set-cookie" not in {k.lower() for k in r.headers}
+
+
+def test_logout_removes_the_cookie(guarded):
+    from ozon_mcp.app import ADMIN_COOKIE
+
+    guarded.cookies.set(ADMIN_COOKIE, ADMIN)
+    r = guarded.get("/logout")
+    assert r.status_code == 303 and r.headers["location"] == "/login"
+    assert "ozon_admin=" in r.headers["set-cookie"]
+    assert "Max-Age=0" in r.headers["set-cookie"] or "expires" in r.headers["set-cookie"].lower()
+
+
+def test_the_old_query_token_keeps_working(guarded):
+    """Его нельзя убрать: MCP-клиенты, не умеющие заголовок, ходят только так."""
+    r = guarded.get("/shops?token=" + ADMIN + "", headers={"accept": "text/html"})
+    assert r.status_code == 200
+
+
+def test_the_header_wins_over_a_stale_cookie(guarded):
+    """Порядок источников: заголовок, потом cookie, потом адрес."""
+    from ozon_mcp.app import ADMIN_COOKIE
+
+    guarded.cookies.set(ADMIN_COOKIE, "stale-token")
+    r = guarded.get("/shops", headers={"accept": "text/html",
+                                       "authorization": "Bearer " + ADMIN})
+    assert r.status_code == 200
+
+
+def test_health_stays_open_without_any_token(guarded):
+    """Его дёргает healthcheck контейнера, у которого токена нет и быть не должно."""
+    assert guarded.get("/api/health").status_code == 200
+
+
+def test_a_pasted_token_with_stray_spaces_is_accepted(guarded):
+    """Копирование из терминала приносит пробел на конце — это не повод не пустить."""
+    r = guarded.post("/login", data={"token": f"  {ADMIN}  "})
+    assert r.status_code == 303
+
+
+def test_a_non_ascii_token_refuses_instead_of_crashing(monkeypatch, tmp_path):
+    """🔴 `secrets.compare_digest` на строках требует ASCII и иначе бросает TypeError.
+
+    В охране админки это означало не отказ, а 500: весь веб-интерфейс падал вместо
+    того, чтобы не пустить. Найдено этим тестом 22.09.2026.
+    """
+    import ozon_mcp.app as app_module
+    import ozon_mcp.server as server_module
+
+    app_module.DATA_DIR = tmp_path
+    server_module.DATA_DIR = tmp_path
+    monkeypatch.setattr(app_module, "ADMIN_TOKEN", "кириллический-токен")
+    from ozon_mcp.app import fastapi_app
+
+    with TestClient(fastapi_app, follow_redirects=False) as c:
+        assert c.get("/api/stats").status_code == 401
+        assert c.get("/api/stats?token=что-то").status_code == 401
+        assert c.get("/api/stats?token=кириллический-токен").status_code == 200

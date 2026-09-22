@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="ru" data-theme="light">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Вход — Ozon MCP Server</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+    <style>
+        :root { --pico-font-size: 15px; }
+        main { max-width: 26rem; margin: 4rem auto; }
+        .why { color: #666; font-size: 0.85rem; margin-top: 1.5rem; line-height: 1.5; }
+        .err { background: #f8d7da; color: #721c24; padding: 0.7rem 1rem;
+               border-radius: 6px; margin-bottom: 1rem; }
+    </style>
+</head>
+<body>
+<main>
+    <h3>Ozon MCP Server</h3>
+    {% if error %}<div class="err">{{ error }}</div>{% endif %}
+    <form method="post" action="/login">
+        <label for="token">Админский токен</label>
+        <!-- autocomplete=off: браузеру незачем запоминать его как пароль сайта,
+             у которого нет учётных записей. -->
+        <input type="password" id="token" name="token" autocomplete="off"
+               autofocus required placeholder="ADMIN_TOKEN из .env на ноде">
+        <button type="submit">Войти</button>
+    </form>
+    <p class="why">
+        Токен передаётся телом запроса и кладётся в cookie, а не в адресную строку:
+        адрес оседает в истории браузера и подставляется при следующем открытии.
+        Прежний способ <code>?token=…</code> продолжает работать для curl и MCP-клиентов,
+        но для браузера он именно этим и плох.
+    </p>
+</main>
+</body>
+</html>

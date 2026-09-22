@@ -18,8 +18,34 @@ from ozon_mcp import app as app_mod
 
 TOKEN = "admin-token-placeholder"
 
-# Два намеренных исключения, каждое со своей причиной.
-EXEMPT = {"/sse", "/messages", "/api/health"}
+# Намеренные исключения, каждое со своей причиной.
+#
+#   /sse, /messages — MCP-транспорт, у него своя авторизация (общий токен либо
+#                     личный токен арендатора), см. `_resolve_mcp_auth`.
+#   /api/health     — его дёргает healthcheck контейнера, у которого токена нет
+#                     и быть не должно; без токена ответ сокращён до живости.
+#   /login          — страница входа. Закрыть её значило бы сделать вход
+#                     недостижимым; она не отдаёт никаких данных кабинета и
+#                     принимает только сам токен.
+EXEMPT = {"/sse", "/messages", "/api/health", "/login"}
+
+
+def test_the_exemption_list_stays_short_and_deliberate():
+    """Список исключений — единственное, что стоит между админкой и открытым миром.
+
+    Сторож не запрещает добавлять в него, но заставляет это заметить: рост списка
+    должен быть решением, а не побочным эффектом нового маршрута.
+    """
+    assert EXEMPT == {"/sse", "/messages", "/api/health", "/login"}, (
+        "список исключений изменился — впишите причину в комментарий выше "
+        "и осознанно поправьте этот сторож")
+
+
+def test_the_login_page_gives_away_nothing_about_the_cabinet(guarded):
+    """Открытая страница обязана быть пустой по содержанию."""
+    body = guarded.get("/login").text
+    for leak in ("shop", "client_id", "api_key", TOKEN):
+        assert leak not in body, f"страница входа выдаёт {leak!r}"
 
 
 @pytest.fixture

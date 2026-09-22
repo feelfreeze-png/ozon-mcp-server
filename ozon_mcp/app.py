@@ -10,7 +10,7 @@ from uuid import UUID
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 from starlette.types import Receive, Scope, Send
 
@@ -259,6 +259,12 @@ async def lifespan(app: FastAPI):
         print("ВНИМАНИЕ: ADMIN_TOKEN не задан — веб-интерфейс открыт всем, кто дотянулся "
               "до порта: список магазинов, заведение и удаление, статистика арендаторов. "
               "Допустимо только на localhost в закрытом контуре.", flush=True)
+    if ADMIN_TOKEN and not ADMIN_TOKEN.isascii():
+        # Cookie по стандарту латинская: вход через форму для такого токена
+        # невозможен, и узнать об этом лучше на старте, чем на странице входа.
+        print("ВНИМАНИЕ: ADMIN_TOKEN содержит нелатинские символы. Заголовок и "
+              "?token= работают, а вход через форму — нет: cookie такого значения "
+              "не несёт. Смените токен на латиницу с цифрами.", flush=True)
     await stats.init_db(DATA_DIR)
     set_stats_callback(stats.record_call)
     global _series_error
@@ -297,10 +303,31 @@ fastapi_app = FastAPI(lifespan=lifespan)
 
 # ─── Авторизация MCP-эндпоинтов ─────────────────────────────
 
+#: Имя cookie со входом в админку.
+ADMIN_COOKIE = "ozon_admin"
+
+#: Сколько живёт вход. Сутки: админка нужна эпизодически, а бессрочная cookie на
+#: рабочей машине — это тот же токен в открытом виде, только дольше.
+ADMIN_COOKIE_MAX_AGE = 24 * 3600
+
+
 def _request_token(request: Request) -> str:
-    """Токен из заголовка Authorization, иначе из ?token=."""
+    """Токен: заголовок `Authorization`, затем cookie, затем `?token=`.
+
+    🔴 **Порядок не случаен, и `?token=` намеренно последний.** Адрес с токеном
+    оседает в истории браузера и подставляется при следующем открытии — то есть
+    секрет переживает сессию в месте, которое никто не чистит. Для curl и для
+    MCP-клиентов, не умеющих ставить заголовок, этот путь оставлен: он не хуже
+    заголовка там, где адрес нигде не сохраняется.
+
+    Браузеру предназначена cookie: она ставится ответом на форму входа, помечена
+    `HttpOnly` (скрипт страницы её не прочитает) и `SameSite=strict` (чужой сайт
+    не заставит браузер её отправить).
+    """
     auth = request.headers.get("authorization", "")
     token = auth.removeprefix("Bearer ").strip()
+    if not token:
+        token = request.cookies.get(ADMIN_COOKIE, "")
     if not token:
         token = request.query_params.get("token", "")
     return token
@@ -346,13 +373,25 @@ ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "").strip()
 #     ответ: живость видно, состав проверок — нет.
 _MCP_PREFIXES = ("/sse", "/messages")
 _LIVENESS_PATH = "/api/health"
+_LOGIN_PATH = "/login"
+
+
+def _same_secret(given: str, expected: str) -> bool:
+    """Сравнение постоянного времени, безопасное для любых символов.
+
+    🔴 `secrets.compare_digest` на строках требует ASCII и на кириллице бросает
+    `TypeError`. В охране админки это означало не отказ, а **500**: токен с
+    нелатинскими символами ронял весь веб-интерфейс вместо того, чтобы не пустить.
+    Найдено тестом 22.09.2026. Сравниваем байты — у них такого ограничения нет.
+    """
+    return secrets.compare_digest(given.encode("utf-8"), expected.encode("utf-8"))
 
 
 def _check_admin_auth(request: Request) -> bool:
     """Допущен ли запрос к админской поверхности."""
     if not ADMIN_TOKEN:
         return True
-    return secrets.compare_digest(_request_token(request), ADMIN_TOKEN)
+    return _same_secret(_request_token(request), ADMIN_TOKEN)
 
 
 @fastapi_app.middleware("http")
@@ -365,10 +404,16 @@ async def _guard_admin_surface(request: Request, call_next):
     того, как стало известно, что админка открыта.
     """
     path = request.url.path
-    if not ADMIN_TOKEN or path.startswith(_MCP_PREFIXES) or path == _LIVENESS_PATH:
+    if (not ADMIN_TOKEN or path.startswith(_MCP_PREFIXES)
+            or path in (_LIVENESS_PATH, _LOGIN_PATH)):
         return await call_next(request)
     if _check_admin_auth(request):
         return await call_next(request)
+    # Человеку в браузере отдаём форму, а не слово «Unauthorized»: голый 401 не
+    # говорит, ЧТО делать, и выглядит поломкой сервера, а не отсутствием входа.
+    # Машине — прежний 401, чтобы curl и скрипты не разбирали HTML.
+    if "text/html" in request.headers.get("accept", ""):
+        return RedirectResponse(_LOGIN_PATH, status_code=303)
     return Response("Unauthorized", status_code=401)
 
 
@@ -435,6 +480,41 @@ fastapi_app.mount("/messages", _messages_asgi)
 
 
 # ─── Веб-интерфейс ──────────────────────────────────────────
+
+@fastapi_app.get(_LOGIN_PATH, response_class=HTMLResponse)
+async def login_form(request: Request):
+    """Форма входа. Единственная страница, открытая без токена."""
+    if not ADMIN_TOKEN:
+        return RedirectResponse("/", status_code=303)
+    return templates.TemplateResponse(request, "login.html", {"error": None})
+
+
+@fastapi_app.post(_LOGIN_PATH, response_class=HTMLResponse)
+async def login_submit(request: Request):
+    form = await request.form()
+    token = str(form.get("token") or "").strip()
+    # Сравнение постоянного времени: обычное `==` отвечает тем быстрее, чем раньше
+    # расходятся строки, и по времени ответа токен подбирается посимвольно.
+    if not (ADMIN_TOKEN and _same_secret(token, ADMIN_TOKEN)):
+        # Ошибка одна на оба случая — и на пустой ввод, и на неверный токен:
+        # «токен неверный» против «токен не введён» подсказывало бы подбирающему,
+        # что он хотя бы в правильном поле.
+        return templates.TemplateResponse(
+            request, "login.html", {"error": "Неверный токен"}, status_code=401)
+
+    response = RedirectResponse("/", status_code=303)
+    response.set_cookie(
+        ADMIN_COOKIE, token, max_age=ADMIN_COOKIE_MAX_AGE,
+        httponly=True, samesite="strict", path="/")
+    return response
+
+
+@fastapi_app.get("/logout")
+async def logout():
+    response = RedirectResponse(_LOGIN_PATH, status_code=303)
+    response.delete_cookie(ADMIN_COOKIE, path="/")
+    return response
+
 
 @fastapi_app.get("/", response_class=HTMLResponse)
 async def dashboard(request: Request):
