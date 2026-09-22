@@ -170,6 +170,17 @@ FORBIDDEN_PERIOD_FIELDS = ("from", "to")
 """🔴 Поля периода в RFC3339. Выбирают дни по UTC, а имя файла в том же ответе — по МСК."""
 
 
+def shift_day(day: str, delta: int) -> str:
+    """Сдвинуть простой день на `delta` суток, оставаясь простым днём.
+
+    Нужен, чтобы окно считалось арифметикой по датам, а не вычитанием секунд из
+    метки времени: секундная арифметика в поясе с переходами даёт «вчера» дважды
+    или ни разу, и это ровно тот сдвиг, ради которого заведён весь B3.
+    """
+    require_plain_day(day, "day")
+    return (date.fromisoformat(day) + timedelta(days=delta)).isoformat()
+
+
 def require_plain_day(value: str, field: str = "date") -> str:
     """Дата обязана быть простой: `YYYY-MM-DD`, без времени и без пояса.
 

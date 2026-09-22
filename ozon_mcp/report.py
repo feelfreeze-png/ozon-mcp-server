@@ -207,35 +207,11 @@ def build(
             "ДРР оказался бы завышенным, оставаясь правдоподобным."
         )
 
-    per_sku: dict[int, dict[str, float]] = {}
-    for row in ad_rows:
-        campaign = row.get("campaign_id")
-        kind = (kinds or {}).get(int(campaign)) if campaign is not None else None
-        if kinds is not None and kind is None:
-            kind = UNKNOWN_KIND
-        expense = float(row.get("expense") or 0.0)
-        orders = int(row.get("orders") or 0) + int(row.get("model_orders") or 0)
-        sales = float(row.get("sales") or 0.0)
-
-        if kind not in MANAGED:
-            # Всё, что не управляется по товарам, складывается ОТДЕЛЬНО по своему виду:
-            # тариф, реферальные, медийные, неопознанные. Ни один из них не входит в
-            # ДРР и ни один не выбрасывается — иначе сумма частей перестанет сходиться
-            # с расходом ряда, и заметить это будет нечем.
-            report.excluded[kind or UNKNOWN_KIND] = (
-                report.excluded.get(kind or UNKNOWN_KIND, 0.0) + expense)
-            continue
-
-        report.managed_expense += expense
-        report.sales += sales
-        report.ad_orders += orders
-        sku = row.get("sku")
-        if sku is None:
-            continue
-        bucket = per_sku.setdefault(int(sku), {"expense": 0.0, "sales": 0.0, "orders": 0})
-        bucket["expense"] += expense
-        bucket["sales"] += sales
-        bucket["orders"] += orders
+    per_sku, totals, excluded = split_by_kind(ad_rows, kinds)
+    report.managed_expense = totals["expense"]
+    report.sales = totals["sales"]
+    report.ad_orders = totals["orders"]
+    report.excluded = excluded
 
     unknown = report.excluded.get(UNKNOWN_KIND, 0.0)
     if unknown:
@@ -288,6 +264,49 @@ def build(
 
     report.anomalies = _anomalies(per_sku, coverage, stock, names)
     return report
+
+
+def split_by_kind(
+    ad_rows: list[dict[str, Any]], kinds: dict[int, str] | None,
+) -> tuple[dict[int, dict[str, float]], dict[str, Any], dict[str, float]]:
+    """Разложить строки ряда на управляемое по товарам и всё остальное.
+
+    Возвращает `(per_sku, totals, excluded)`. Вынесено отдельно, чтобы отчёт и
+    рекомендации считали управляемый расход **одним** кодом: две копии этого правила
+    разошлись бы молча, и какая из них попала в совет, выяснялось бы задним числом.
+
+    Всё неуправляемое складывается по своему виду и не выбрасывается — иначе сумма
+    частей перестанет сходиться с расходом ряда, и заметить это будет нечем.
+    """
+    per_sku: dict[int, dict[str, float]] = {}
+    excluded: dict[str, float] = {}
+    totals = {"expense": 0.0, "sales": 0.0, "orders": 0}
+
+    for row in ad_rows:
+        campaign = row.get("campaign_id")
+        kind = (kinds or {}).get(int(campaign)) if campaign is not None else None
+        if kinds is not None and kind is None:
+            kind = UNKNOWN_KIND
+        expense = float(row.get("expense") or 0.0)
+        orders = int(row.get("orders") or 0) + int(row.get("model_orders") or 0)
+        sales = float(row.get("sales") or 0.0)
+
+        if kind not in MANAGED:
+            excluded[kind or UNKNOWN_KIND] = excluded.get(kind or UNKNOWN_KIND, 0.0) + expense
+            continue
+
+        totals["expense"] += expense
+        totals["sales"] += sales
+        totals["orders"] += orders
+        sku = row.get("sku")
+        if sku is None:
+            continue
+        bucket = per_sku.setdefault(int(sku), {"expense": 0.0, "sales": 0.0, "orders": 0})
+        bucket["expense"] += expense
+        bucket["sales"] += sales
+        bucket["orders"] += orders
+
+    return per_sku, totals, excluded
 
 
 def _named(sku: int, names: dict[int, str] | None) -> dict[str, Any]:

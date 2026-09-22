@@ -306,3 +306,27 @@ def test_stats_today_boundary_is_moscow_midnight_expressed_in_utc():
     start = tz.msk_day_start_utc("2026-09-20")
     assert start.isoformat() == "2026-09-19T21:00:00+00:00"
     assert start.strftime("%Y-%m-%d %H:%M:%S") == "2026-09-19 21:00:00"
+
+
+# ── Сдвиг дня ────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("day,delta,expected", [
+    ("2026-09-26", -6, "2026-09-20"),
+    ("2026-10-02", -6, "2026-09-26"),   # через границу месяца
+    ("2027-01-03", -6, "2026-12-28"),   # через границу года
+    ("2028-03-01", -1, "2028-02-29"),   # високосный
+    ("2026-09-20", 0, "2026-09-20"),
+])
+def test_the_window_is_built_by_date_arithmetic(day, delta, expected):
+    """🔴 Окно считается по датам, а не вычитанием секунд.
+
+    Секундная арифметика в поясе с переходами даёт «вчера» дважды или ни разу —
+    ровно тот сдвиг, ради которого заведён весь пакет B3.
+    """
+    assert tz.shift_day(day, delta) == expected
+
+
+def test_a_timestamp_is_not_a_day_and_is_refused():
+    with pytest.raises(Exception):
+        tz.shift_day("2026-09-20T00:00:00Z", -1)

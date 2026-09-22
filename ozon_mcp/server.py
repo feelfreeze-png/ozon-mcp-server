@@ -834,6 +834,16 @@ TOOLS = [
     _tool("ozon_questions",
           "Buyer questions (вопросы покупателей).",
           {"limit": {"type": "integer", "default": 50}, "last_id": {"type": "string"}}),
+    _tool("ozon_ad_advice",
+          "[P0] Proposed ACTIONS for the ad account — not observations: object, action and "
+          "grounds, so the owner can say yes or no. Refuses on a window shorter than 7 days "
+          "or with a gap: one day flips the verdict on a product (рекомендации по рекламе).",
+          {"days": {"type": "integer", "default": 7, "description": "длина окна в днях"},
+           "date_to": {"type": "string", "description": "последний день окна, YYYY-MM-DD; "
+                                                        "по умолчанию вчера по Москве"},
+           "min_expense": {"type": "number", "default": 0,
+                           "description": "не предлагать по товарам дешевле, ₽"},
+           "top": {"type": "integer", "default": 50}}),
     _tool("ozon_question_stats",
           "[P0] How many buyer questions are UNANSWERED — counted by answers_count, not by "
           "status. Ozon's own `unprocessed` counter means «operator has not marked it», not "
@@ -1457,6 +1467,52 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
                 "входит. Обычная причина — кампанию удалили после того, как она "
                 "потратила деньги.")
         return _json(built.as_dict())
+
+    if name == "ozon_ad_advice":
+        if not series.is_enabled():
+            raise failures.OzonBusinessError(
+                "хранилище ряда не открыто: советовать не из чего", endpoint="series.db")
+        from ozon_mcp import advice as advice_mod
+
+        db = series.connection()
+        day_to = arguments.get("date_to") or timezones.yesterday_msk()
+        days = max(1, int(arguments.get("days") or advice_mod.MIN_DAYS))
+        day_from = timezones.shift_day(day_to, -(days - 1))
+
+        rows = await series_read.ad_rows_for_report(
+            db, shop_id=shop_id, date_from=day_from, date_to=day_to)
+        cover = await series_read.coverage(
+            db, shop_id=shop_id, date_from=day_from, date_to=day_to)
+
+        # Классификация обязана прийти: без неё управляемый расход не отделить от
+        # тарифа, и совет «снять с продвижения» мог бы указывать на кампанию, ставку
+        # которой агент не двигает вовсе.
+        perf = _get_perf(shop_id)
+        listing = await perf.campaigns_by_ids(
+            [row["campaign_id"] for row in rows if row.get("campaign_id")])
+        kinds = report.campaign_kinds(listing["list"])
+
+        per_sku, _totals, _excluded = report.split_by_kind(rows, kinds)
+        stock = await series_read.stock_on_day(db, shop_id=shop_id, day=day_to)
+        names = await series_read.names_for_skus(db, shop_id=shop_id, skus=list(per_sku))
+
+        try:
+            built = advice_mod.build(
+                window={"с": day_from, "по": day_to, "пояс": "МСК"},
+                coverage=cover, per_sku=per_sku, stock=stock, names=names,
+                min_expense=float(arguments.get("min_expense") or 0.0),
+                top=int(arguments.get("top") or 50))
+        except advice_mod.AdviceRefused as exc:
+            # Отказ — это ответ, а не ошибка разбора: он называет причину и окно.
+            return _json({"рекомендаций": None, "ОТКАЗ": str(exc),
+                          "окно": {"с": day_from, "по": day_to, "пояс": "МСК"},
+                          "coverage": cover})
+        payload = built.as_dict()
+        if listing["missing"]:
+            payload["замечания"].append(
+                f"Ozon не вернул {len(listing['missing'])} кампаний из ряда — их расход "
+                "не отнесён к управляемому и в предложения не вошёл.")
+        return _json(payload)
 
     if name in ("ozon_ad_series", "ozon_stock_series"):
         # Читаем СВОЁ хранилище, а не Ozon: ключей для этого не нужно, зато нужен
