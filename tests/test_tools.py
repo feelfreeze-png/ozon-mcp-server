@@ -1,3 +1,4 @@
+import pytest
 """Схемы инструментов: то, что уходит клиенту в каждой сессии."""
 
 
@@ -66,3 +67,101 @@ def test_registry_description_fits_the_limit():
 
     manifest = json.loads((pathlib.Path(__file__).resolve().parent.parent / "server.json").read_text())
     assert len(manifest["description"]) <= 100, len(manifest["description"])
+
+
+# ── Вопросы покупателей: статус ≠ наличие ответа ─────────────────────────────
+
+
+class _Questions:
+    """Кабинет с вопросами: страницы плюс собственный счётчик Ozon."""
+
+    def __init__(self, pages, counters):
+        self.pages = list(pages)
+        self.counters = counters
+        self.calls = 0
+
+    async def question_list(self, limit=100, last_id="", sort_dir="DESC"):
+        index = 0 if not last_id else int(last_id)
+        items, cursor, has_next = self.pages[index]
+        self.calls += 1
+        return {"questions": items, "last_id": cursor, "has_next": has_next}
+
+    async def question_count(self):
+        return dict(self.counters)
+
+
+def _client_with_questions(seller):
+    from ozon_mcp.client import OzonSellerClient
+
+    client = OzonSellerClient.__new__(OzonSellerClient)
+    client.question_list = seller.question_list
+    client.question_count = seller.question_count
+    return client
+
+
+def _q(qid, answers):
+    return {"id": qid, "sku": 1, "answers_count": answers, "status": "VIEWED",
+            "published_at": "2026-09-01T00:00:00Z", "text": "?"}
+
+
+@pytest.mark.asyncio
+async def test_unanswered_is_counted_by_answers_not_by_status():
+    """🔴 Замер 22.09.2026: счётчик Ozon расходится с фактом в ОБЕ стороны.
+
+    `unprocessed` = 28 при 27 вопросах без ответа, и это разные множества:
+    три отвеченных числятся необработанными, два неотвеченных — обработанными.
+    Статус — отметка оператора, наличие ответа — факт о карточке.
+    """
+    seller = _Questions(
+        pages=[([_q("a", 0), _q("b", 1), _q("c", 0)], "", False)],
+        counters={"all": 3, "unprocessed": 1, "processed": 2})
+    got = await _client_with_questions(seller).questions_all(pause_s=0)
+
+    assert got["без ответа"] == 2, "посчитано по статусу, а не по answers_count"
+    assert got["счётчик Ozon"]["unprocessed"] == 1
+    assert "счётчик и факт расходятся" in got, "расхождение обязано быть названо"
+
+
+@pytest.mark.asyncio
+async def test_agreement_between_counter_and_fact_says_nothing():
+    seller = _Questions(
+        pages=[([_q("a", 0), _q("b", 1)], "", False)],
+        counters={"all": 2, "unprocessed": 1})
+    got = await _client_with_questions(seller).questions_all(pause_s=0)
+    assert got["без ответа"] == 1
+    assert "счётчик и факт расходятся" not in got
+
+
+@pytest.mark.asyncio
+async def test_the_walk_covers_every_page():
+    seller = _Questions(
+        pages=[([_q(f"a{i}", 0) for i in range(100)], "1", True),
+               ([_q(f"b{i}", 1) for i in range(50)], "", False)],
+        counters={"all": 150, "unprocessed": 100})
+    got = await _client_with_questions(seller).questions_all(pause_s=0)
+
+    assert got["всего собрано"] == 150 and got["страниц"] == 2
+    assert got["без ответа"] == 100
+    assert "ОБХОД НЕПОЛОН" not in got
+
+
+@pytest.mark.asyncio
+async def test_a_truncated_walk_is_named_not_swallowed():
+    """Молчаливый недобор выдал бы очередь меньшей, чем она есть."""
+    seller = _Questions(
+        pages=[([_q("a", 0)], "", False)],
+        counters={"all": 369, "unprocessed": 28})
+    got = await _client_with_questions(seller).questions_all(pause_s=0)
+
+    assert "ОБХОД НЕПОЛОН" in got
+    assert "369" in got["ОБХОД НЕПОЛОН"]
+
+
+@pytest.mark.asyncio
+async def test_the_page_cap_stops_an_endless_cursor():
+    """Курсор, который всегда обещает ещё страницу, не должен крутиться вечно."""
+    seller = _Questions(
+        pages=[([_q("a", 0)], "0", True)] * 3,
+        counters={"all": 1, "unprocessed": 0})
+    got = await _client_with_questions(seller).questions_all(max_pages=3, pause_s=0)
+    assert got["страниц"] == 3

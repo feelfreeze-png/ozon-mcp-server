@@ -1019,8 +1019,72 @@ class OzonSellerClient:
                                 {"question_id": question_id, "sku": sku, "text": text})
 
     async def question_count(self) -> dict:
-        """POST /v1/question/count — количество вопросов по статусам."""
+        """POST /v1/question/count — количество вопросов по статусам.
+
+        ⚠️ **Статус — не про наличие ответа.** См. `questions_all`.
+        """
         return await self._post("/v1/question/count", {})
+
+    #: Пауза между страницами обхода вопросов.
+    QUESTIONS_PAGE_PAUSE_S = 2.0
+
+    async def questions_all(self, *, max_pages: int = 20,
+                            pause_s: float | None = None) -> dict:
+        """Полный обход вопросов со сверкой по счётчику Ozon.
+
+        🔴 **Считать «без ответа» по статусу нельзя.** Замер 22.09.2026 на боевом
+        кабинете: `/v1/question/count` отдал `unprocessed: 28`, а вопросов с
+        `answers_count = 0` оказалось **27**, и это РАЗНЫЕ множества:
+
+            VIEWED,   ответа нет  — 25
+            VIEWED,   ответ есть  —  3   ← счётчик зовёт их необработанными
+            PROCESSED, ответа нет —  2   ← счётчик зовёт их обработанными
+
+        Статус — отметка оператора («просмотрел», «обработал»), а наличие ответа —
+        факт о карточке. Взять счётчик за число неотвеченных значило бы ошибиться в
+        обе стороны сразу, и число выглядело бы правдоподобно.
+
+        Поэтому обход полный, «без ответа» считается по `answers_count`, а счётчик
+        Ozon возвращается рядом — чтобы расхождение было видно, а не выбрано.
+        """
+        pause = self.QUESTIONS_PAGE_PAUSE_S if pause_s is None else pause_s
+        collected: list[dict] = []
+        last_id, pages = "", 0
+        while pages < max_pages:
+            payload = await self.question_list(limit=100, last_id=last_id)
+            items = payload.get("questions") or []
+            collected.extend(items)
+            pages += 1
+            last_id = payload.get("last_id") or ""
+            if not payload.get("has_next") or not items:
+                break
+            if pause:
+                await asyncio.sleep(pause)
+
+        counters = await self.question_count()
+        unanswered = [q for q in collected
+                      if not numbers.parse_int(q.get("answers_count"), field="answers_count")]
+        reported = numbers.parse_int(counters.get("all"), field="all")
+        out: dict[str, Any] = {
+            "всего собрано": len(collected),
+            "без ответа": len(unanswered),
+            "страниц": pages,
+            "счётчик Ozon": counters,
+            "вопросы": collected,
+        }
+        if reported is not None and reported != len(collected):
+            # Обход, оборвавшийся молча, выдал бы очередь меньшей, чем она есть.
+            out["ОБХОД НЕПОЛОН"] = (
+                f"собрано {len(collected)} при `all` = {reported}. Либо не хватило "
+                f"{max_pages} страниц, либо курсор оборвался."
+            )
+        if reported is not None and counters.get("unprocessed") != len(unanswered):
+            out["счётчик и факт расходятся"] = (
+                f"unprocessed = {counters.get('unprocessed')}, а без ответа "
+                f"{len(unanswered)}. Это нормально: статус — отметка оператора, "
+                f"а не наличие ответа. Верить второму."
+            )
+        return out
 
     # ── Чат ────────────────────────────────────────────────
     # v1/v2 list, v1/v2 history и v1/v2 updates УДАЛЕНЫ (404). Актуально:

@@ -834,6 +834,12 @@ TOOLS = [
     _tool("ozon_questions",
           "Buyer questions (вопросы покупателей).",
           {"limit": {"type": "integer", "default": 50}, "last_id": {"type": "string"}}),
+    _tool("ozon_question_stats",
+          "[P0] How many buyer questions are UNANSWERED — counted by answers_count, not by "
+          "status. Ozon's own `unprocessed` counter means «operator has not marked it», not "
+          "«no answer», and the two differ in both directions (сколько вопросов без ответа).",
+          {"with_items": {"type": "boolean", "default": False,
+                          "description": "вернуть и сами неотвеченные вопросы"}}),
     _tool("ozon_question_reply",
           "Reply to a buyer question; needs the product sku (ответить на вопрос).",
           {"question_id": {"type": "string"}, "sku": {"type": "integer"}, "text": {"type": "string"}},
@@ -1655,6 +1661,17 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
     # === ВОПРОСЫ ===
     if name == "ozon_questions":
         return _json(await s.question_list(limit=arguments.get("limit", 50), last_id=arguments.get("last_id", "")))
+    if name == "ozon_question_stats":
+        walked = await s.questions_all()
+        unanswered = [q for q in walked.pop("вопросы")
+                      if not (q.get("answers_count") or 0)]
+        if arguments.get("with_items"):
+            walked["неотвеченные"] = sorted(
+                ({"question_id": q.get("id"), "sku": q.get("sku"),
+                  "опубликован": q.get("published_at"), "текст": q.get("text"),
+                  "ссылка": q.get("question_link")} for q in unanswered),
+                key=lambda item: item["опубликован"] or "", reverse=True)
+        return _json(walked)
     if name == "ozon_question_reply":
         return _json(await s.question_reply(arguments["question_id"], arguments["sku"], arguments["text"]))
 
