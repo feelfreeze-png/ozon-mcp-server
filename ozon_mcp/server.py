@@ -1021,12 +1021,22 @@ def _visible_tools() -> list[Tool]:
     контекста в каждой сессии. Как только магазинов становится больше одного,
     параметр возвращается в схемы.
 
-    Исключение — сессия, привязанная к магазину своим токеном: там параметр не
-    возвращается никогда, сколько бы магазинов ни было заведено. Показывать его
+    Исключение — сессия, привязанная к ОДНОМУ магазину своим токеном: там параметр
+    не возвращается никогда, сколько бы магазинов ни было заведено. Показывать его
     значило бы предлагать модели выбор, которого у неё нет: подставится всё равно
     привязанный магазин (tenancy.enforce), а чужие shop_id ей знать незачем.
+
+    🔴 Когда к токену привязано НЕСКОЛЬКО магазинов, параметр обязан вернуться.
+    Спрятать его тут значило бы отдать модели каталог инструментов, которым
+    физически нельзя выбрать магазин, — и она добросовестно отчиталась бы по
+    одному, ни словом не упомянув, что остальные существуют. Ровно так утренний
+    бриф 23.09 показал один кабинет из четырёх и назвал покрытие полным.
     """
-    if tenancy.pinned() is None:
+    if tenancy.pinned_one() is None:
+        # Привязки нет вовсе — решает число заведённых магазинов (прежняя ветка).
+        # Привязка есть, но магазинов в ней несколько — выбор у модели настоящий.
+        if tenancy.pinned() is not None:
+            return TOOLS
         try:
             from ozon_mcp.settings import load_shops
             if len(load_shops(DATA_DIR)) > 1:
@@ -1078,10 +1088,22 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     error_text = None
     # Подстановка идёт до всего остального: и статистика, и shaping должны видеть
     # тот магазин, к которому привязана сессия, а не тот, что назвала модель.
-    arguments = _coerce_numeric_ids(tenancy.enforce(arguments))
+    #
+    # Отказ по чужому магазину случается ЗДЕСЬ — раньше, чем появится контекст
+    # вызова. Если дать ему улететь отсюда, он уйдёт мимо конверта и мимо
+    # статистики: наружу выпадет голое исключение транспорта, а в журнале вызова
+    # не останется вовсе. Поэтому он откладывается и поднимается уже внутри try —
+    # там, где его подберёт общий путь отказа.
+    pending_refusal: Exception | None = None
+    try:
+        arguments = _coerce_numeric_ids(tenancy.enforce(arguments))
+    except tenancy.ForeignShopError as refusal:
+        pending_refusal = refusal
     shop_id = arguments.get("shop_id", "")
     token = _CALL_CONTEXT.set((name, arguments))
     try:
+        if pending_refusal is not None:
+            raise pending_refusal
         result = await _call_tool_impl(name, arguments)
         return result
     except Exception as e:
@@ -1150,11 +1172,14 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
         from ozon_mcp.settings import get_shop_list
         shops = get_shop_list(DATA_DIR)
         # В привязанной сессии соседи не перечисляются: их shop_id клиенту не нужен
-        # (подставляется свой), а знание чужих идентификаторов — готовая половина
-        # атаки, если подстановка когда-нибудь будет обойдена.
-        pinned_shop = tenancy.pinned()
-        if pinned_shop is not None:
-            shops = [s for s in shops if s.get("id") == pinned_shop]
+        # (свои он и так получит), а знание чужих идентификаторов — готовая половина
+        # атаки, если граница когда-нибудь будет обойдена.
+        #
+        # Фильтр — по вхождению в список токена, а не по равенству одному значению:
+        # именно равенство и оставляло владельцу четырёх кабинетов ровно один.
+        pinned_shops = tenancy.pinned()
+        if pinned_shops is not None:
+            shops = [s for s in shops if s.get("id") in pinned_shops]
         return _json(shops)
 
     # Деградации (без shop_id)

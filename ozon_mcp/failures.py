@@ -22,6 +22,10 @@
   повторять (429 и 5xx — да, 400 — нет);
 * `ozon_business` — код 200, а в теле поле `error`. Отказ, выдающий себя за данные;
 * `network` — до Ozon не дошли: таймаут, DNS, обрыв;
+* `forbidden` — запрос отвергнут нашей же границей доступа, до Ozon не пошёл вовсе.
+  Отдельный род от `our_bug`, потому что чинить тут нечего: это штатный ответ «не
+  твоё». Слитый с `our_bug`, он читался бы как «сервер сломан» и уводил бы разбор
+  в код вместо выданных прав;
 * `our_bug` — нарушен наш собственный контракт: лимит, пояс, состав ответа. Повторять
   бессмысленно, чинить надо код.
 """
@@ -32,9 +36,12 @@ from typing import Any
 
 import httpx
 
+from ozon_mcp.tenancy import ForeignShopError
+
 OZON_HTTP = "ozon_http"
 OZON_BUSINESS = "ozon_business"
 NETWORK = "network"
+FORBIDDEN = "forbidden"
 OUR_BUG = "our_bug"
 
 #: Коды, на которых повтор осмыслен. Тот же набор, что у ретраев клиента.
@@ -88,6 +95,18 @@ def classify(exc: BaseException) -> dict[str, Any]:
             "message": f"{type(exc).__name__}: {exc}",
             "retryable": True,
         }
+    if isinstance(exc, ForeignShopError):
+        # Список доступного кладётся в сам отказ: без него модель знает только, что
+        # «нельзя», и следующий её шаг — перебор. С ним она называет причину и
+        # переспрашивает по делу.
+        return {
+            "kind": FORBIDDEN,
+            "status": None,
+            "message": str(exc),
+            "retryable": False,
+            "requested": exc.requested,
+            "allowed": list(exc.allowed),
+        }
     return {
         "kind": OUR_BUG,
         "status": None,
@@ -122,6 +141,7 @@ def human_text(error: dict[str, Any]) -> str:
         OZON_HTTP: "Ozon ответил ошибкой",
         OZON_BUSINESS: "Ozon ответил успехом, но в теле отказ",
         NETWORK: "до Ozon не дошли",
+        FORBIDDEN: "запрос отвергнут границей доступа, в Ozon не отправлялся",
         OUR_BUG: "нарушен наш собственный контракт",
     }.get(kind, "отказ")
     tail = " Повтор осмыслен." if detail.get("retryable") else " Повторять бессмысленно."

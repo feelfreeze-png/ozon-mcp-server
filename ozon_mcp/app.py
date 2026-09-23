@@ -333,18 +333,21 @@ def _request_token(request: Request) -> str:
     return token
 
 
-def _resolve_mcp_auth(request: Request) -> tuple[bool, str | None]:
-    """`(допущен, привязанный shop_id)` для /sse и /messages.
+def _resolve_mcp_auth(request: Request) -> tuple[bool, tuple[str, ...] | None]:
+    """`(допущен, привязанные shop_id)` для /sse и /messages.
 
     Личные токены клиентов, если заданы, ПОЛНОСТЬЮ вытесняют общий MCP_AUTH_TOKEN.
     Иначе общий остался бы входом без привязки к магазину — то есть ровно той дырой,
     ради которой режим и вводится: достаточно было бы предъявить его вместо своего,
     чтобы снова выбирать магазин аргументом.
+
+    Магазинов у токена может быть несколько (`MCP_CLIENT_TOKENS=tok:shop1|shop2`) —
+    для владельца нескольких кабинетов это один клиент, а не несколько.
     """
     token = _request_token(request)
     if tenancy.is_enabled():
-        shop_id = tenancy.resolve(token)
-        return shop_id is not None, shop_id
+        shops = tenancy.resolve(token)
+        return shops is not None, shops
     if not MCP_AUTH_TOKEN:
         return True, None
     return secrets.compare_digest(token, MCP_AUTH_TOKEN), None
@@ -439,13 +442,13 @@ def _is_live_session(request: Request) -> bool:
 
 @fastapi_app.get("/sse")
 async def sse_endpoint(request: Request):
-    allowed, shop_id = _resolve_mcp_auth(request)
+    allowed, shops = _resolve_mcp_auth(request)
     if not allowed:
         return Response("Unauthorized", status_code=401)
     # Привязка ставится ДО mcp_app.run: вызовы инструментов исполняются внутри его
     # цикла, в этой же задаче, и подхватывают контекст сами. POST /messages только
     # кладёт сообщение в поток сессии, своего контекста у него нет.
-    pin = tenancy.pin(shop_id)
+    pin = tenancy.pin(shops)
     try:
         mcp_app = get_mcp_app()
         async with sse_transport.connect_sse(
