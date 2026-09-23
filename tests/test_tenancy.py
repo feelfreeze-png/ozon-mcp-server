@@ -81,6 +81,35 @@ def test_token_with_only_separators_is_dropped_not_opened(monkeypatch):
     assert tenancy.resolve("ddd") is None
 
 
+def test_unparseable_variable_closes_the_door_instead_of_opening_it(monkeypatch):
+    """🔴 Блокер: опечатка в переменной не должна открывать сервер настежь.
+
+    Записи отбрасываются поштучно. Если отброшены ВСЕ, словарь пуст — и по
+    `is_enabled()` сервер неотличим от «режим выключен». Дальше при пустом
+    `MCP_AUTH_TOKEN` он пускает вообще без токена: одна опечатка снимала бы
+    и привязку, и авторизацию разом, а снаружи это выглядит как «всё работает».
+    """
+    from ozon_mcp import app as app_mod
+    monkeypatch.setattr(app_mod, "MCP_AUTH_TOKEN", "")
+    monkeypatch.setenv("MCP_CLIENT_TOKENS", "мусор-без-двоеточия,ddd:||")
+
+    assert tenancy.client_tokens() == {}, "мусор разбираться не должен"
+    assert tenancy.is_enabled() is False
+    assert tenancy.is_configured() is True, "переменная ЗАДАНА — это и есть отличие"
+
+    assert app_mod._resolve_mcp_auth(_request("хоть что-то")) == (False, None)
+    assert app_mod._resolve_mcp_auth(_request("")) == (False, None)
+
+
+def test_truly_empty_variable_still_means_mode_off(monkeypatch):
+    """Обратная сторона: пустая переменная — это по-прежнему выключенный режим."""
+    from ozon_mcp import app as app_mod
+    monkeypatch.setattr(app_mod, "MCP_AUTH_TOKEN", "shared")
+    monkeypatch.setenv("MCP_CLIENT_TOKENS", "   ")
+    assert tenancy.is_configured() is False
+    assert app_mod._resolve_mcp_auth(_request("shared")) == (True, None)
+
+
 def test_resolve(monkeypatch):
     monkeypatch.setenv("MCP_CLIENT_TOKENS", "aaa:shop1,bbb:shop2|shop3")
     assert tenancy.resolve("aaa") == ("shop1",)
@@ -123,9 +152,40 @@ def pinned_to_three():
     tenancy.unpin(token)
 
 
-def test_several_shops_default_to_the_first(pinned_to_three):
-    assert tenancy.enforce({})["shop_id"] == "alfa"
-    assert tenancy.enforce({"shop_id": ""})["shop_id"] == "alfa"
+def test_several_shops_do_not_guess_a_default(pinned_to_three):
+    """Не назван магазин — аргумент не трогаем, а НЕ подставляем первый.
+
+    Подстановка «первого» вернула бы дефект 23.09 через другую дверь: модель,
+    забывшая `shop_id` на одном из четырёх кабинетов, получила бы числа первого
+    и записала их под заголовком того, о котором спрашивала. Спросит диспетчер
+    (`_call_tool_impl`, ветка «Укажите shop_id»).
+    """
+    assert tenancy.enforce({}) == {}
+    assert tenancy.enforce({"shop_id": ""}) == {"shop_id": ""}
+
+
+@pytest.mark.asyncio
+async def test_missing_shop_asks_and_lists_only_own_shops(monkeypatch, tmp_path):
+    """Диспетчер спрашивает магазин — и перечисляет ТОЛЬКО свои.
+
+    Прежняя редакция брала весь каталог сервера, то есть на вопрос «а какие у
+    меня есть» отвечала в том числе чужими идентификаторами — ровно тем, что
+    `ozon_list_shops` прячет намеренно.
+    """
+    save_shops(tmp_path, {"alfa": {"name": "Альфа"}, "beta": {"name": "Бета"},
+                          "alien": {"name": "Чужой"}})
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+
+    token = tenancy.pin(["alfa", "beta"])
+    try:
+        blocks = await _call_tool_impl("ozon_ad_campaigns", {})
+    finally:
+        tenancy.unpin(token)
+
+    text = blocks[0].text
+    assert "Укажите shop_id" in text
+    assert "alfa" in text and "beta" in text
+    assert "alien" not in text, "чужой магазин не перечисляем даже в подсказке"
 
 
 def test_several_shops_honour_an_own_shop(pinned_to_three):
@@ -307,6 +367,31 @@ async def test_brief_over_several_cabinets_sees_all_of_them(monkeypatch, tmp_pat
     assert visible, "при нескольких магазинах shop_id обязан остаться в схемах"
 
 
+def test_multishop_pin_keeps_shop_id_even_when_catalogue_has_one(monkeypatch, tmp_path):
+    """Изолирует ветку «привязка есть, магазинов в ней несколько».
+
+    В brief-тесте её не отличить: там каталог из четырёх магазинов, и параметр
+    вернулся бы и по старой ветке «магазинов на сервере больше одного». Здесь
+    каталог из ОДНОГО, поэтому решает только привязка.
+
+    Ветка несущая, а не косметическая. Без неё получается тупик: схемы прячут
+    `shop_id`, модель его не присылает, а `enforce` при нескольких магазинах
+    ничего не подставляет — каждый вызов упирается в «Укажите shop_id», ответить
+    на который нечем.
+    """
+    save_shops(tmp_path, {"alfa": {"name": "Альфа", "ozon_client_id": "1",
+                                   "ozon_api_key": "a"}})
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+
+    token = tenancy.pin(["alfa", "beta"])
+    try:
+        visible = [t.name for t in _visible_tools()
+                   if "shop_id" in (t.inputSchema.get("properties") or {})]
+    finally:
+        tenancy.unpin(token)
+    assert visible, "при нескольких магазинах в токене параметр обязан остаться"
+
+
 @pytest.mark.asyncio
 async def test_foreign_shop_refusal_is_structured_and_counted(monkeypatch, tmp_path):
     """Отказ уходит конвертом рода `forbidden` и попадает в статистику.
@@ -344,6 +429,55 @@ async def test_foreign_shop_refusal_is_structured_and_counted(monkeypatch, tmp_p
     assert len(seen) == 1, "отказ обязан попасть в журнал вызовов"
     assert seen[0][0] == "ozon_ad_campaigns"
     assert seen[0][1] is False
+    assert seen[0][2] == "alfa", (
+        "отказ пишется на СВОЙ магазин: иначе арендатор пишет строки журнала под "
+        "чужим идентификатором, просто называя его в аргументе")
+
+
+def test_refusal_text_does_not_publish_the_shop_list_to_neighbours():
+    """🔴 Перечень магазинов не должен попадать в ТЕКСТ исключения.
+
+    `str(exc)` уходит в общую таблицу вызовов (`stats.record_call`), а она не
+    разделена по арендаторам: `ozon_degradations` — профиль core, выключить
+    нельзя, фильтра по магазину нет — отдаёт тексты ошибок любому клиенту.
+    Состав кабинета в этом тексте означал бы, что достаточно один раз попросить
+    чужой магазин, чтобы опубликовать соседям список своих.
+
+    Спросившему список всё равно нужен — он приходит отдельным полем конверта,
+    и конверт уходит только ему.
+    """
+    exc = tenancy.ForeignShopError("delta", ("alfa", "beta", "gamma"))
+    text = str(exc)
+    assert "delta" in text, "что именно отвергнуто — сказать обязаны"
+    for own in ("alfa", "beta", "gamma"):
+        assert own not in text, f"{own} не должен попасть в общий журнал"
+
+    from ozon_mcp import failures
+    detail = failures.classify(exc)
+    assert detail["allowed"] == ["alfa", "beta", "gamma"], "спросившему — полный список"
+    assert "alfa" in failures.human_text({"_error": detail})
+
+
+@pytest.mark.asyncio
+async def test_shop_in_token_but_missing_on_server_is_named_not_hidden(monkeypatch, tmp_path):
+    """Опечатка в токене не должна выглядеть как «столько кабинетов и есть».
+
+    Ровно форма дефекта 23.09: клиенту видно МЕНЬШЕ, чем у него есть, и узнать
+    об этом неоткуда. Недостача называется вслух.
+    """
+    save_shops(tmp_path, {"alfa": {"name": "Альфа"}, "beta": {"name": "Бета"}})
+    monkeypatch.setattr(server, "DATA_DIR", tmp_path)
+
+    token = tenancy.pin(["alfa", "beta", "opechatka"])
+    try:
+        blocks = await _call_tool_impl("ozon_list_shops", {})
+    finally:
+        tenancy.unpin(token)
+
+    text = blocks[0].text
+    assert "opechatka" in text, "пропавший магазин обязан быть назван"
+    assert "НЕ НАЙДЕНЫ" in text
+    assert "alfa" in text and "beta" in text
 
 
 @pytest.mark.asyncio
@@ -353,10 +487,15 @@ async def test_refused_call_never_reaches_ozon(monkeypatch, tmp_path):
     Отдельно от предыдущего, потому что конверт правильного рода можно получить и
     после похода в Ozon — а тогда чужой запрос уже отправлен и, возможно, оплачен.
     """
-    save_shops(tmp_path, {"alfa": {"name": "Альфа", "ozon_perf_client_id": "1",
-                                   "ozon_perf_client_secret": "a"},
-                          "delta": {"name": "Дельта", "ozon_perf_client_id": "4",
-                                    "ozon_perf_client_secret": "d"}})
+    # Ключи ОБЕ половины и у обоих магазинов: без них «delta» упрётся в их
+    # отсутствие ещё до всякой границы, и растяжка не сработает ни при каком
+    # исходе. Первая редакция этого теста так и была написана — «delta» имел
+    # только Performance-ключи, а диспетчер строит Seller-клиента раньше, чем
+    # доходит до рекламных веток. Тест зеленел, не проверяя заявленного.
+    full = lambda n: {"name": n, "ozon_client_id": "1", "ozon_api_key": "k",
+                      "ozon_perf_client_id": "2", "ozon_perf_client_secret": "s"}
+    save_shops(tmp_path, {"alfa": full("Альфа"), "beta": full("Бета"),
+                          "delta": full("Дельта")})
     monkeypatch.setattr(server, "DATA_DIR", tmp_path)
 
     calls: list[str] = []
@@ -365,9 +504,10 @@ async def test_refused_call_never_reaches_ozon(monkeypatch, tmp_path):
         calls.append(shop_id)
         raise AssertionError("отвергнутый вызов не должен доходить до клиента Ozon")
 
-    # raising=True намеренно: с `raising=False` опечатка в имени завела бы атрибут
-    # с нуля, растяжка не встала бы ни на чей путь, и тест прошёл бы впустую —
-    # доказав ровно ничего. Именно так первая редакция этого теста и была написана.
+    # Растяжки на ОБЕ двери к сети, и обе с raising=True: с `raising=False`
+    # опечатка в имени завела бы атрибут с нуля, растяжка не встала бы ни на чей
+    # путь, и тест прошёл бы впустую — доказав ровно ничего.
+    monkeypatch.setattr(server, "_get_seller", _tripwire, raising=True)
     monkeypatch.setattr(server, "_get_perf", _tripwire, raising=True)
 
     token = tenancy.pin(["alfa", "beta"])

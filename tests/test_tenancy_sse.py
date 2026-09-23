@@ -30,6 +30,10 @@ from ozon_mcp.settings import save_shops
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOKEN_ALFA = "token-alfa-placeholder"
 TOKEN_BETA = "token-beta-placeholder"
+#: Владелец двух кабинетов. Именно этот шов — «запись в переменной → токен →
+#: привязка → список магазинов» — и дал дефект 23.09; юнит-тесты его не видят,
+#: потому что ставят привязку сами вызовом `tenancy.pin(...)`.
+TOKEN_OWNER = "token-owner-placeholder"
 
 
 def _free_port() -> int:
@@ -57,7 +61,8 @@ def server(tmp_path_factory):
         "DATA_DIR": str(data_dir),
         "HEALTH_CHECK_INTERVAL_MIN": "0",
         "MCP_AUTH_TOKEN": "",
-        "MCP_CLIENT_TOKENS": f"{TOKEN_ALFA}:alfa,{TOKEN_BETA}:beta",
+        "MCP_CLIENT_TOKENS": (f"{TOKEN_ALFA}:alfa,{TOKEN_BETA}:beta,"
+                              f"{TOKEN_OWNER}:alfa|beta"),
         "OZON_TOOLSETS": "",
         "PYTHONPATH": str(REPO_ROOT),
     }
@@ -131,6 +136,49 @@ def test_foreign_shop_id_over_the_wire_changes_nothing(server):
     text = result.content[0].text
     assert "alfa" in text, text
     assert "beta" not in text, f"сервер полез в чужой магазин: {text}"
+
+
+def test_owner_of_two_cabinets_sees_both_over_the_wire(server):
+    """🔴 Воспроизведение дефекта 23.09 на живом сервере, от переменной до ответа.
+
+    Юнит-тесты ставят привязку сами (`tenancy.pin([...])`) и поэтому шов
+    «строка в MCP_CLIENT_TOKENS → разбор → GET /sse → contextvar → вызов»
+    не проверяют вовсе. Дефект жил именно там: разбор отдавал ОДИН магазин,
+    всё остальное работало безупречно, и бриф честно отчитался по одному
+    кабинету из четырёх, написав, что покрытие полное.
+
+    Мутация `pin(shops[:1])` в app.py роняет этот тест и не роняет ни одного
+    юнит-теста — ради этого он и написан.
+    """
+    tools, result = _run(server, TOKEN_OWNER)
+    text = result.content[0].text
+    assert "alfa" in text and "beta" in text, f"владелец обязан видеть оба: {text}"
+
+    # Вторая половина: видеть два магазина и не иметь чем их выбрать — то же
+    # самое, что видеть один. Параметр обязан присутствовать в схемах.
+    selectable = [t.name for t in tools if "shop_id" in (t.inputSchema.get("properties") or {})]
+    assert selectable, "при двух магазинах shop_id обязан остаться в схемах"
+
+
+def test_owner_is_refused_a_shop_outside_his_token(server):
+    """Свои — оба, чужой — отказ, а не молчаливая подмена своим."""
+    _, result = _run(server, TOKEN_OWNER, "ozon_ad_campaigns", {"shop_id": "gamma"})
+    text = " ".join(c.text for c in result.content)
+    assert "forbidden" in text, text
+    assert "gamma" in text
+
+
+def test_single_shop_tenant_is_unaffected_by_the_multishop_change(server):
+    """Сторож регрессии: у односкладочного арендатора всё как было.
+
+    На проде сейчас живут только такие токены. Если правка многомагазинного
+    режима заденет их, каждый существующий клиент начнёт получать отказы там,
+    где раньше молча работал.
+    """
+    tools, result = _run(server, TOKEN_ALFA)
+    assert "beta" not in result.content[0].text
+    leaking = [t.name for t in tools if "shop_id" in (t.inputSchema.get("properties") or {})]
+    assert not leaking, "у одного магазина параметр по-прежнему скрыт"
 
 
 def test_unknown_token_is_rejected(server):

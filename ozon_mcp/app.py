@@ -345,7 +345,11 @@ def _resolve_mcp_auth(request: Request) -> tuple[bool, tuple[str, ...] | None]:
     для владельца нескольких кабинетов это один клиент, а не несколько.
     """
     token = _request_token(request)
-    if tenancy.is_enabled():
+    # is_configured, а НЕ is_enabled: если переменная задана, но ни одна запись не
+    # разобралась, `resolve` вернёт None каждому — и это правильный исход. Проверка
+    # по `is_enabled` увела бы такую конфигурацию в ветку общего токена, а при
+    # пустом MCP_AUTH_TOKEN — в «пускаем всех». Опечатка не должна открывать сервер.
+    if tenancy.is_configured():
         shops = tenancy.resolve(token)
         return shops is not None, shops
     if not MCP_AUTH_TOKEN:

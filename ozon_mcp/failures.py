@@ -146,6 +146,11 @@ def human_text(error: dict[str, Any]) -> str:
     }.get(kind, "отказ")
     tail = " Повтор осмыслен." if detail.get("retryable") else " Повторять бессмысленно."
     status_text = f" (код {status})" if status else ""
+    # Перечень доступного дописывается здесь, а не в текст исключения: этот блок
+    # уходит спросившему клиенту, а `str(exc)` — в общую таблицу вызовов, откуда
+    # его читают соседи (см. ForeignShopError).
+    if kind == FORBIDDEN and detail.get("allowed"):
+        tail = f" Доступны: {', '.join(detail['allowed'])}." + tail
     return f"Ошибка — {where}{status_text}: {detail.get('message')}.{tail}"
 
 

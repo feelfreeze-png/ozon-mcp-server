@@ -1099,6 +1099,11 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
         arguments = _coerce_numeric_ids(tenancy.enforce(arguments))
     except tenancy.ForeignShopError as refusal:
         pending_refusal = refusal
+        # Отвергнутый вызов записывается на СВОЙ магазин, а не на запрошенный.
+        # Иначе арендатор получает право писать строки в журнал под чужим
+        # идентификатором — просто называя его в аргументе, — и «расход по
+        # магазину X» перестаёт означать обращения владельца X.
+        arguments = {**arguments, "shop_id": refusal.allowed[0]}
     shop_id = arguments.get("shop_id", "")
     token = _CALL_CONTEXT.set((name, arguments))
     try:
@@ -1180,6 +1185,16 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
         pinned_shops = tenancy.pinned()
         if pinned_shops is not None:
             shops = [s for s in shops if s.get("id") in pinned_shops]
+            # Магазин, записанный в токен с опечаткой, иначе просто исчезает:
+            # клиент видит три кабинета вместо четырёх и считает, что так и надо.
+            # Именно так выглядел дефект 23.09 — «меньше, чем есть» без признака,
+            # что чего-то не хватает. Поэтому недостача называется вслух.
+            missing = [s for s in pinned_shops if s not in {x.get("id") for x in shops}]
+            if missing:
+                return _json({"магазины": shops, "НЕ НАЙДЕНЫ НА СЕРВЕРЕ": missing,
+                              "что это значит": "Эти магазины есть в вашем токене, но "
+                              "не заведены на сервере. Отчёт по ним будет неполным — "
+                              "сообщите оператору."})
         return _json(shops)
 
     # Деградации (без shop_id)
@@ -1205,13 +1220,23 @@ async def _call_tool_impl(name: str, arguments: dict) -> list[TextContent]:
 
     shop_id = arguments.get("shop_id", "")
     if not shop_id:
-        # Попробовать default
-        from ozon_mcp.settings import load_shops
-        shops = load_shops(DATA_DIR)
-        if len(shops) == 1:
-            shop_id = next(iter(shops))
+        # Перечисляем ТОЛЬКО свои магазины. Прежняя редакция брала весь каталог
+        # сервера, то есть отвечала чужими идентификаторами на вопрос «а какие
+        # у меня есть» — ровно то, что ozon_list_shops прячет намеренно.
+        pinned_shops = tenancy.pinned()
+        if pinned_shops is not None:
+            if len(pinned_shops) == 1:
+                shop_id = pinned_shops[0]
+            else:
+                return [TextContent(type="text", text=(
+                    f"Укажите shop_id. Доступные магазины: {list(pinned_shops)}"))]
         else:
-            return [TextContent(type="text", text=f"Укажите shop_id. Доступные магазины: {list(shops.keys())}")]
+            from ozon_mcp.settings import load_shops
+            shops = load_shops(DATA_DIR)
+            if len(shops) == 1:
+                shop_id = next(iter(shops))
+            else:
+                return [TextContent(type="text", text=f"Укажите shop_id. Доступные магазины: {list(shops.keys())}")]
 
     s = _get_seller(shop_id)
 
